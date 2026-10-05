@@ -28,6 +28,20 @@ import {
   ValidityStatus,
 } from './types';
 
+export type EventReadView<TxType> = Pick<
+  AbstractChainNetwork<TxType>,
+  'getBlockTransactionIds' | 'getTransaction' | 'getBlockInfo'
+>;
+
+/** Keep event-carrier operations typed independently from ordinary network reads. */
+export interface EventReadHandlers<TxType> {
+  readonly serializeTx: (transaction: TxType) => string;
+  readonly verifyLockTransactionExtraConditions: (
+    transaction: TxType,
+    blockInfo: BlockInfo,
+  ) => Promise<boolean>;
+}
+
 abstract class AbstractChain<TxType> {
   abstract readonly CHAIN: string;
   abstract readonly NATIVE_TOKEN_ID: string;
@@ -164,6 +178,33 @@ abstract class AbstractChain<TxType> {
   verifyEvent = async (
     event: EventTrigger,
     feeConfig: ChainMinimumFee,
+  ): Promise<boolean> =>
+    this.verifyEventWithReader(event, feeConfig, this.network);
+
+  /**
+   * verifies an event using the reader owned by this invocation
+   * @param event the event trigger model
+   * @param feeConfig minimum fee and rsn ratio config for the event
+   * @param reader the block and transaction reads for this verification
+   * @returns true if the event verified
+   */
+  protected verifyEventWithReader = async (
+    event: EventTrigger,
+    feeConfig: ChainMinimumFee,
+    reader: EventReadView<TxType>,
+  ): Promise<boolean> =>
+    this.verifyEventWithReaderUsingHandlers(event, feeConfig, reader, {
+      serializeTx: (transaction) => this.serializeTx(transaction),
+      verifyLockTransactionExtraConditions: (transaction, blockInfo) =>
+        this.verifyLockTransactionExtraConditions(transaction, blockInfo),
+    });
+
+  /** Verify through a typed event reader while preserving the chain-owned policy handlers. */
+  protected verifyEventWithReaderUsingHandlers = async <EventTxType>(
+    event: EventTrigger,
+    feeConfig: ChainMinimumFee,
+    reader: EventReadView<EventTxType>,
+    handlers: EventReadHandlers<EventTxType>,
   ): Promise<boolean> => {
     if (!this.extractor)
       throw new ImpossibleBehavior(
@@ -175,27 +216,27 @@ abstract class AbstractChain<TxType> {
     ).toString('hex');
 
     try {
-      const blockTxs = await this.network.getBlockTransactionIds(
-        event.sourceBlockId,
-      );
+      const blockTxs = await reader.getBlockTransactionIds(event.sourceBlockId);
       if (!blockTxs.includes(event.sourceTxId)) {
         this.logger.info(
           `Event [${eventId}] is not valid, lock tx [${event.sourceTxId}] is not in event source block [${event.sourceBlockId}]`,
         );
         return false;
       }
-      const tx = await this.network.getTransaction(
+      const tx = await reader.getTransaction(
         event.sourceTxId,
         event.sourceBlockId,
       );
-      const blockInfo = await this.network.getBlockInfo(event.sourceBlockId);
-      if (!(await this.verifyLockTransactionExtraConditions(tx, blockInfo))) {
+      const blockInfo = await reader.getBlockInfo(event.sourceBlockId);
+      if (
+        !(await handlers.verifyLockTransactionExtraConditions(tx, blockInfo))
+      ) {
         this.logger.info(
           `Event [${eventId}] is not valid, lock tx [${event.sourceTxId}] is not verified`,
         );
         return false;
       }
-      const data = this.extractor.get(this.serializeTx(tx));
+      const data = this.extractor.get(handlers.serializeTx(tx));
       if (!data) {
         this.logger.info(
           `Event [${eventId}] is not valid, failed to extract rosen data from lock transaction`,

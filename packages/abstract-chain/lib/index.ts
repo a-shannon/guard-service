@@ -1,4 +1,5 @@
 export { default as AbstractChain } from './abstractChain';
+export type { EventReadHandlers, EventReadView } from './abstractChain';
 export { default as AbstractUtxoChain } from './abstractUtxoChain';
 export { default as AbstractChainNetwork } from './network/abstractChainNetwork';
 export { default as AbstractUtxoChainNetwork } from './network/abstractUtxoChainNetwork';

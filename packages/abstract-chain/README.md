@@ -119,9 +119,19 @@ Required functions are as follows:
 - `verifyEvent`
   - verifies an event data with its corresponding lock transaction
   - **@param** `event` the event trigger model
-  - **@param** `eventSerializedBox` the serialized string of the event trigger box
   - **@param** `feeConfig` minimum fee and rsn ratio config for the event
   - **@returns** true if the event is verified
+- `verifyEventWithReader` (protected)
+  - verifies an event with the same checks and error handling as `verifyEvent`
+  - **@param** `event` the event trigger model
+  - **@param** `feeConfig` minimum fee and rsn ratio config for the event
+  - **@param** `reader` an exported `EventReadView<TxType>` providing
+    `getBlockTransactionIds`, `getTransaction` and `getBlockInfo`
+  - **@returns** true if the event is verified
+  - The public `verifyEvent` method passes the configured network. A subclass
+    can instead acquire a reader for its event and pass it to this helper.
+    Keep captured session state within that invocation so concurrent events
+    cannot replace each other's block or transaction observations.
 - `isTxValid`
   - checks if a transaction is still valid and can be sent to the network
   - **@param** `transaction` the transaction
