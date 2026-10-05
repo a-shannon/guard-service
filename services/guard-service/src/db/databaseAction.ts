@@ -29,6 +29,10 @@ import {
 
 import PublicStatusHandler from '../handlers/publicStatusHandler';
 import { ReprocessStatus } from '../reprocess/interfaces';
+import type {
+  SigningRowPreimage,
+  SigningPersistenceAuthorization,
+} from '../signing/transactionSigningContext';
 import { AddressType, Page, SortRequest } from '../types/api';
 import { SupportedChain } from '../types/config';
 import {
@@ -51,6 +55,13 @@ import { RevenueView } from './entities/revenueView';
 import { TransactionEntity } from './entities/transactionEntity';
 
 const logger = DefaultLogger.getInstance().child(import.meta.url);
+
+export interface TransactionCheckPreimage extends SigningRowPreimage {
+  readonly lastCheck: number;
+  readonly lastStatusUpdate: string | null;
+  readonly failedInSign: boolean;
+  readonly signFailedCount: number;
+}
 
 class DatabaseAction {
   private static instance: DatabaseAction;
@@ -268,6 +279,92 @@ class DatabaseAction {
     );
   };
 
+  /** Capture before RPC waits; the returned primitive fields cannot follow caller mutation. */
+  captureTxCheckPreimage = (
+    row: TransactionEntity,
+  ): TransactionCheckPreimage => {
+    const expected = Object.freeze({
+      txId: row.txId,
+      txJson: row.txJson,
+      chain: row.chain,
+      type: row.type,
+      status: row.status,
+      requiredSign: row.requiredSign,
+      eventId: row.event?.id ?? null,
+      orderId: row.order?.id ?? null,
+      lastCheck: row.lastCheck,
+      lastStatusUpdate: row.lastStatusUpdate,
+      failedInSign: row.failedInSign,
+      signFailedCount: row.signFailedCount,
+    });
+    this.txCheckPredicate(expected);
+    return expected;
+  };
+
+  /** Builds the exact transaction preimage predicate for a last-check update. */
+  private txCheckPredicate = (expected: TransactionCheckPreimage) => {
+    const base = this.signingRowPredicate(expected);
+    if (
+      ![TransactionStatus.sent, TransactionStatus.signFailed].includes(
+        expected.status,
+      ) ||
+      !Number.isSafeInteger(expected.lastCheck) ||
+      expected.lastCheck < 0 ||
+      (expected.lastStatusUpdate !== null &&
+        typeof expected.lastStatusUpdate !== 'string') ||
+      typeof expected.failedInSign !== 'boolean' ||
+      !Number.isSafeInteger(expected.signFailedCount) ||
+      expected.signFailedCount < 0
+    )
+      throw new Error('Invalid transaction last-check preimage');
+    return {
+      ...base,
+      lastCheck: expected.lastCheck,
+      lastStatusUpdate:
+        expected.lastStatusUpdate === null
+          ? IsNull()
+          : expected.lastStatusUpdate,
+      failedInSign: expected.failedInSign,
+      signFailedCount: expected.signFailedCount,
+    };
+  };
+
+  /** Records liveness only; this does not authorize signing or reopen an event. */
+  updateTxLastCheckIfUnchanged = async (
+    input: TransactionCheckPreimage,
+    currentHeight: number,
+  ): Promise<boolean> => {
+    const expected = Object.freeze({ ...input });
+    const predicate = this.txCheckPredicate(expected);
+    if (
+      !Number.isSafeInteger(currentHeight) ||
+      currentHeight < expected.lastCheck
+    )
+      throw new Error('Invalid or regressing transaction check height');
+    const conflict = new Error('Transaction last-check CAS conflict');
+    try {
+      return await this.dataSource.transaction(async (manager) => {
+        const repository = manager.getRepository(TransactionEntity);
+        if (!(await repository.existsBy(predicate))) return false;
+        const result = await repository.update(predicate, {
+          lastCheck: currentHeight,
+        });
+        if (result.affected !== 1) throw conflict;
+        if (
+          !(await repository.existsBy({
+            ...predicate,
+            lastCheck: currentHeight,
+          }))
+        )
+          throw new Error('Transaction last-check postcondition failed');
+        return true;
+      });
+    } catch (error) {
+      if (error === conflict) return false;
+      throw error;
+    }
+  };
+
   /**
    * updates the status of an event and sets firstTry columns with current timestamp
    * @param eventId the event trigger id
@@ -317,6 +414,548 @@ class DatabaseAction {
       txId,
       TransactionStatus.signed,
     );
+  };
+
+  /** Validates every field before TypeORM can omit an undefined predicate. */
+  private signingRowPredicate = (expected: SigningRowPreimage) => {
+    const {
+      txId,
+      txJson,
+      chain,
+      type,
+      status,
+      requiredSign,
+      eventId,
+      orderId,
+    } = expected;
+    if (
+      [txId, txJson, chain, type].some(
+        (value) => typeof value !== 'string' || value.length === 0,
+      ) ||
+      !Object.values(TransactionStatus).includes(status) ||
+      !Number.isSafeInteger(requiredSign) ||
+      requiredSign < 1 ||
+      [eventId, orderId].some(
+        (id) => id !== null && (typeof id !== 'string' || id.length === 0),
+      )
+    )
+      throw new Error('Invalid signed transaction preimage');
+
+    return {
+      txId,
+      txJson,
+      chain,
+      type,
+      status,
+      requiredSign,
+      event: eventId === null ? IsNull() : { id: eventId },
+      order: orderId === null ? IsNull() : { id: orderId },
+    };
+  };
+
+  /** Changes status only while every captured transaction field still matches. */
+  setTxStatusIfUnchanged = async (
+    expected: SigningRowPreimage,
+    status: string,
+    authorization?: SigningPersistenceAuthorization,
+  ): Promise<boolean> => {
+    const predicate = this.signingRowPredicate(expected);
+    if (
+      !Object.values(TransactionStatus).includes(status) ||
+      (status === TransactionStatus.signFailed &&
+        predicate.status !== TransactionStatus.inSign)
+    )
+      throw new Error('Invalid transaction status transition');
+    const changes = {
+      status,
+      lastStatusUpdate: String(Math.round(Date.now() / 1000)),
+      ...(status === TransactionStatus.signFailed
+        ? {
+            signFailedCount: () => '"signFailedCount" + 1',
+            failedInSign: true,
+          }
+        : {}),
+    };
+    const result = authorization
+      ? await this.persistSigningTransition(expected, changes, authorization)
+      : await this.TransactionRepository.update(predicate, changes);
+    if (result.affected !== 1) return false;
+    PublicStatusHandler.getInstance().updatePublicTxStatus(
+      predicate.txId,
+      status,
+    );
+    return true;
+  };
+
+  /** Persists a qualified result only while its exact signing row still exists. */
+  updateWithSignedTxIfUnchanged = async (
+    expected: SigningRowPreimage,
+    signedJson: string,
+    authorization?: SigningPersistenceAuthorization,
+  ): Promise<boolean> => {
+    const predicate = this.signingRowPredicate(expected);
+    if (
+      predicate.status !== TransactionStatus.inSign ||
+      typeof signedJson !== 'string' ||
+      signedJson.length === 0
+    )
+      throw new Error('Invalid signed transaction preimage');
+    const changes = {
+      txJson: signedJson,
+      status: TransactionStatus.signed,
+      lastStatusUpdate: String(Math.round(Date.now() / 1000)),
+    };
+    const result = authorization
+      ? await this.persistSigningTransition(expected, changes, authorization)
+      : await this.TransactionRepository.update(predicate, changes);
+    if (result.affected !== 1) return false;
+    PublicStatusHandler.getInstance().updatePublicTxStatus(
+      predicate.txId,
+      TransactionStatus.signed,
+    );
+    return true;
+  };
+
+  /** Reconciles actual signed reward bytes; the internal caller supplies spent authority. */
+  recoverSignedRewardIfUnchanged = async (
+    input: SigningRowPreimage,
+    signedJson: string,
+    authorization: SigningPersistenceAuthorization,
+  ): Promise<boolean> => {
+    const expected = Object.freeze({ ...input });
+    this.signingRowPredicate(expected);
+    if (
+      expected.status !== TransactionStatus.signFailed ||
+      expected.type !== TransactionType.reward ||
+      expected.chain !== 'ergo' ||
+      expected.eventId === null ||
+      expected.orderId !== null ||
+      typeof signedJson !== 'string' ||
+      !signedJson ||
+      !authorization ||
+      typeof authorization.assertActive !== 'function' ||
+      typeof authorization.assertBefore !== 'function' ||
+      typeof authorization.assertAfter !== 'function'
+    )
+      throw new Error('Invalid reward recovery preimage or authority');
+    const result = await this.persistSigningTransition(
+      expected,
+      {
+        txJson: signedJson,
+        status: TransactionStatus.sent,
+        lastStatusUpdate: String(Math.round(Date.now() / 1000)),
+      },
+      authorization,
+    );
+    if (result.affected !== 1) return false;
+    PublicStatusHandler.getInstance().updatePublicTxStatus(
+      expected.txId,
+      TransactionStatus.sent,
+    );
+    return true;
+  };
+
+  /**
+   * Persists a qualified observed payment without reopening its event. The caller
+   * supplies execution authority; this method only enforces the atomic preimage.
+   */
+  recoverSignedPaymentIfUnchanged = async (
+    input: TransactionCheckPreimage,
+    signedJson: string,
+    authorization: SigningPersistenceAuthorization,
+  ): Promise<boolean> => {
+    const expected = Object.freeze({ ...input });
+    const predicate = this.txCheckPredicate(expected);
+    if (
+      expected.status !== TransactionStatus.signFailed ||
+      expected.type !== TransactionType.payment ||
+      expected.chain !== 'ergo' ||
+      expected.eventId === null ||
+      expected.orderId !== null ||
+      typeof signedJson !== 'string' ||
+      !authorization ||
+      typeof authorization.assertActive !== 'function' ||
+      typeof authorization.assertBefore !== 'function' ||
+      typeof authorization.assertAfter !== 'function'
+    )
+      throw new Error('Invalid payment recovery preimage or authority');
+    // Structural identity only; canonical signed semantics belong to the caller.
+    const model = JSON.parse(signedJson);
+    if (
+      !model ||
+      typeof model !== 'object' ||
+      Array.isArray(model) ||
+      model.network !== expected.chain ||
+      model.txId !== expected.txId ||
+      model.eventId !== expected.eventId ||
+      model.txType !== expected.type ||
+      typeof model.txBytes !== 'string' ||
+      !/^(?:[0-9a-f]{2})+$/.test(model.txBytes)
+    )
+      throw new Error('Invalid payment recovery signed model');
+    const assertActive = authorization.assertActive.bind(authorization);
+    const assertBefore = authorization.assertBefore.bind(authorization);
+    const assertAfter = authorization.assertAfter.bind(authorization);
+    const conflict = new Error('Payment recovery CAS conflict');
+    let recovered: boolean;
+    try {
+      recovered = await this.dataSource.transaction(async (manager) => {
+        assertActive();
+        const repository = manager.getRepository(TransactionEntity);
+        if (!(await repository.existsBy(predicate))) return false;
+        const events = manager.getRepository(ConfirmedEventEntity);
+        const event = await events.findOne({
+          where: { id: expected.eventId! },
+          relations: ['eventData'],
+        });
+        if (
+          !event ||
+          event.status !== EventStatus.inPayment ||
+          !event.eventData
+        )
+          throw new Error('Invalid payment recovery event');
+        const eventSnapshot = JSON.stringify(event);
+        await assertBefore(manager, expected);
+        assertActive();
+        const after = Object.freeze({
+          ...expected,
+          txJson: signedJson,
+          status: TransactionStatus.sent,
+          lastStatusUpdate: String(Math.round(Date.now() / 1000)),
+        });
+        const result = await repository.update(predicate, {
+          txJson: after.txJson,
+          status: after.status,
+          lastStatusUpdate: after.lastStatusUpdate,
+        });
+        if (result.affected !== 1) throw conflict;
+        await assertAfter(manager, after);
+        if (!(await repository.existsBy(this.txCheckPredicate(after))))
+          throw new Error('Payment recovery row postcondition failed');
+        const currentEvent = await events.findOne({
+          where: { id: expected.eventId! },
+          relations: ['eventData'],
+        });
+        if (JSON.stringify(currentEvent) !== eventSnapshot)
+          throw new Error('Payment recovery event postcondition failed');
+        assertActive();
+        return true;
+      });
+    } catch (error) {
+      if (error === conflict) return false;
+      throw error;
+    }
+    if (recovered)
+      PublicStatusHandler.getInstance().updatePublicTxStatus(
+        expected.txId,
+        TransactionStatus.sent,
+      );
+    return recovered;
+  };
+
+  /** Internal qualified callers supply checks that use only this owned manager. */
+  private persistSigningTransition = async (
+    input: SigningRowPreimage,
+    changes: QueryDeepPartialEntity<TransactionEntity>,
+    authorization: SigningPersistenceAuthorization,
+  ): Promise<UpdateResult> => {
+    const expected = Object.freeze({ ...input });
+    const predicate = this.signingRowPredicate(expected);
+    return this.dataSource.transaction(async (manager) => {
+      const repository = manager.getRepository(TransactionEntity);
+      authorization.assertActive();
+      const before = await repository.findOne({ where: predicate });
+      if (!before) return { affected: 0, raw: [], generatedMaps: [] };
+      await authorization.assertBefore(manager, expected);
+      authorization.assertActive();
+      const result = await repository.update(predicate, changes);
+      if (result.affected !== 1)
+        throw new Error('Signing persistence update conflict');
+      const after = Object.freeze({
+        ...expected,
+        status: changes.status as string,
+        txJson:
+          typeof changes.txJson === 'string' ? changes.txJson : expected.txJson,
+      });
+      await authorization.assertAfter(manager, after);
+      const current = await repository.findOne({
+        where: this.signingRowPredicate(after),
+      });
+      const failed = after.status === TransactionStatus.signFailed;
+      if (
+        !current ||
+        current.lastCheck !== before.lastCheck ||
+        current.lastStatusUpdate !== changes.lastStatusUpdate ||
+        current.failedInSign !== (failed ? true : before.failedInSign) ||
+        current.signFailedCount !== before.signFailedCount + (failed ? 1 : 0)
+      )
+        throw new Error('Signing persistence postcondition failed');
+      // No await between the last ownership check and returning to commit.
+      authorization.assertActive();
+      return result;
+    });
+  };
+
+  /** Completes the captured sent row and its related process in one commit. */
+  finalizeTxIfUnchanged = async (
+    expected: SigningRowPreimage,
+    authorization?: SigningPersistenceAuthorization,
+  ): Promise<boolean> => {
+    const predicate = this.signingRowPredicate(expected);
+    const { eventId, orderId } = expected;
+    const isEvent = [TransactionType.payment, TransactionType.reward].includes(
+      predicate.type as TransactionType,
+    );
+    const isOrder = predicate.type === TransactionType.arbitrary;
+    const isManagement = [
+      TransactionType.coldStorage,
+      TransactionType.manual,
+    ].includes(predicate.type as TransactionType);
+    if (
+      predicate.status !== TransactionStatus.sent ||
+      (isEvent && (eventId === null || orderId !== null)) ||
+      (isOrder && (orderId === null || eventId !== null)) ||
+      (isManagement && (eventId !== null || orderId !== null)) ||
+      (!isEvent && !isOrder && !isManagement)
+    )
+      throw new Error('Invalid transaction finalization preimage');
+    const eventPhase =
+      predicate.type === TransactionType.reward
+        ? EventStatus.inReward
+        : EventStatus.inPayment;
+    const eventStatus =
+      predicate.type === TransactionType.payment && predicate.chain !== 'ergo'
+        ? EventStatus.pendingReward
+        : EventStatus.completed;
+    const now = String(Math.round(Date.now() / 1000));
+    const conflict = new Error('Transaction finalization CAS conflict');
+    try {
+      await this.dataSource.transaction(async (manager) => {
+        authorization?.assertActive();
+        const transactions = manager.getRepository(TransactionEntity);
+        const before = authorization
+          ? await transactions.findOne({ where: predicate })
+          : undefined;
+        if (authorization && !before) throw conflict;
+        if (authorization) await authorization.assertBefore(manager, expected);
+        // Resolve the required association before changing either row.
+        const events = manager.getRepository(ConfirmedEventEntity);
+        const orders = manager.getRepository(ArbitraryEntity);
+        if (
+          isEvent &&
+          !(await events.findOneBy({ id: eventId!, status: eventPhase }))
+        )
+          throw conflict;
+        if (
+          isOrder &&
+          !(await orders.findOneBy({
+            id: orderId!,
+            status: OrderStatus.inProcess,
+          }))
+        )
+          throw conflict;
+        authorization?.assertActive();
+        const tx = await manager
+          .getRepository(TransactionEntity)
+          .update(predicate, {
+            status: TransactionStatus.completed,
+            lastStatusUpdate: now,
+          });
+        if (tx.affected !== 1) throw conflict;
+        if (isEvent) {
+          const event = await events.update(
+            { id: eventId!, status: eventPhase },
+            {
+              status: eventStatus,
+              ...(eventStatus === EventStatus.pendingReward
+                ? { firstTry: now }
+                : {}),
+            },
+          );
+          if (event.affected !== 1) throw conflict;
+        } else if (isOrder) {
+          const order = await orders.update(
+            { id: orderId!, status: OrderStatus.inProcess },
+            {
+              status: OrderStatus.completed,
+            },
+          );
+          if (order.affected !== 1) throw conflict;
+        }
+        if (authorization) {
+          const after = Object.freeze({
+            ...expected,
+            status: TransactionStatus.completed,
+          });
+          await authorization.assertAfter(manager, after);
+          const current = await transactions.findOne({
+            where: this.signingRowPredicate(after),
+          });
+          if (
+            !current ||
+            current.lastStatusUpdate !== now ||
+            current.lastCheck !== before!.lastCheck ||
+            current.failedInSign !== before!.failedInSign ||
+            current.signFailedCount !== before!.signFailedCount
+          )
+            throw new Error('Completion persistence postcondition failed');
+          authorization.assertActive();
+        }
+      });
+    } catch (error) {
+      if (error === conflict) return false;
+      throw error;
+    }
+    PublicStatusHandler.getInstance().updatePublicTxStatus(
+      predicate.txId,
+      TransactionStatus.completed,
+    );
+    if (isEvent)
+      PublicStatusHandler.getInstance().updatePublicEventStatus(
+        eventId!,
+        eventStatus,
+      );
+    return true;
+  };
+
+  /** Invalidates an unchanged checked row and reopens its process atomically. */
+  invalidateTxIfUnchanged = async (
+    expected: SigningRowPreimage | TransactionCheckPreimage,
+    lastCheck: number,
+    unexpected: boolean,
+    authorization?: SigningPersistenceAuthorization,
+  ): Promise<boolean> => {
+    expected = Object.freeze({ ...expected });
+    const predicate = {
+      ...('lastCheck' in expected
+        ? this.txCheckPredicate(expected)
+        : this.signingRowPredicate(expected)),
+      lastCheck,
+    };
+    if ('lastCheck' in expected && expected.lastCheck !== lastCheck)
+      throw new Error('Invalid invalidation check height');
+    const { eventId, orderId } = expected;
+    const isEvent = [TransactionType.payment, TransactionType.reward].includes(
+      predicate.type as TransactionType,
+    );
+    const isOrder = predicate.type === TransactionType.arbitrary;
+    const isManagement = [
+      TransactionType.coldStorage,
+      TransactionType.manual,
+    ].includes(predicate.type as TransactionType);
+    if (
+      ![TransactionStatus.sent, TransactionStatus.signFailed].includes(
+        predicate.status,
+      ) ||
+      !Number.isSafeInteger(lastCheck) ||
+      lastCheck < 0 ||
+      typeof unexpected !== 'boolean' ||
+      (isEvent && (eventId === null || orderId !== null)) ||
+      (isOrder && (orderId === null || eventId !== null)) ||
+      (isManagement && (eventId !== null || orderId !== null)) ||
+      (!isEvent && !isOrder && !isManagement)
+    )
+      throw new Error('Invalid transaction invalidation preimage');
+    const isReward = predicate.type === TransactionType.reward;
+    const eventPhase = isReward ? EventStatus.inReward : EventStatus.inPayment;
+    const eventStatus = isReward
+      ? EventStatus.pendingReward
+      : EventStatus.pendingPayment;
+    const now = String(Math.round(Date.now() / 1000));
+    const conflict = new Error('Transaction invalidation CAS conflict');
+    try {
+      await this.dataSource.transaction(async (manager) => {
+        authorization?.assertActive();
+        const transactions = manager.getRepository(TransactionEntity);
+        const before = authorization
+          ? await transactions.findOne({ where: predicate })
+          : undefined;
+        if (authorization && !before) throw conflict;
+        if (authorization) await authorization.assertBefore(manager, expected);
+        const events = manager.getRepository(ConfirmedEventEntity);
+        const orders = manager.getRepository(ArbitraryEntity);
+        const eventBefore = isEvent
+          ? await events.findOneBy({ id: eventId!, status: eventPhase })
+          : undefined;
+        if (isEvent && !eventBefore) throw conflict;
+        if (
+          isOrder &&
+          !(await orders.findOneBy({
+            id: orderId!,
+            status: OrderStatus.inProcess,
+          }))
+        )
+          throw conflict;
+        authorization?.assertActive();
+        const tx = await manager
+          .getRepository(TransactionEntity)
+          .update(predicate, {
+            status: TransactionStatus.invalid,
+            lastStatusUpdate: now,
+          });
+        if (tx.affected !== 1) throw conflict;
+        const increment = unexpected
+          ? { unexpectedFails: () => '"unexpectedFails" + 1' }
+          : {};
+        if (isEvent) {
+          const event = await events.update(
+            { id: eventId!, status: eventPhase },
+            { status: eventStatus, ...increment },
+          );
+          if (event.affected !== 1) throw conflict;
+        } else if (isOrder) {
+          const order = await orders.update(
+            { id: orderId!, status: OrderStatus.inProcess },
+            { status: OrderStatus.pending, ...increment },
+          );
+          if (order.affected !== 1) throw conflict;
+        }
+        if (authorization) {
+          const after = Object.freeze({
+            ...expected,
+            status: TransactionStatus.invalid,
+          });
+          await authorization.assertAfter(manager, after, { unexpected });
+          const current = await transactions.findOne({
+            where: { ...this.signingRowPredicate(after), lastCheck },
+          });
+          const eventAfter = isEvent
+            ? await events.findOneBy({ id: eventId! })
+            : undefined;
+          if (
+            !current ||
+            current.lastStatusUpdate !== now ||
+            current.failedInSign !== before!.failedInSign ||
+            current.signFailedCount !== before!.signFailedCount ||
+            (isEvent &&
+              (!eventAfter ||
+                JSON.stringify({
+                  ...eventAfter,
+                  status: eventBefore!.status,
+                  unexpectedFails:
+                    eventAfter.unexpectedFails - (unexpected ? 1 : 0),
+                }) !== JSON.stringify(eventBefore)))
+          )
+            throw new Error('Transaction invalidation postcondition failed');
+          if (isEvent && eventAfter!.status !== eventStatus)
+            throw new Error('Transaction invalidation event phase changed');
+          authorization.assertActive();
+        }
+      });
+    } catch (error) {
+      if (error === conflict) return false;
+      throw error;
+    }
+    PublicStatusHandler.getInstance().updatePublicTxStatus(
+      predicate.txId,
+      TransactionStatus.invalid,
+    );
+    if (isEvent)
+      PublicStatusHandler.getInstance().updatePublicEventStatus(
+        eventId!,
+        eventStatus,
+      );
+    return true;
   };
 
   /**
@@ -430,6 +1069,203 @@ class DatabaseAction {
       paymentTx.txId,
       TransactionStatus.approved,
     );
+  };
+
+  /** Stores a synchronized payment only against its exact pending event. */
+  insertSynchronizedPaymentIfUnchanged = async (
+    paymentTx: PaymentTransaction,
+    expectedEvent: ConfirmedEventEntity,
+    requiredSign: number,
+    currentHeight: number,
+    assertAuthority?: () => void,
+  ): Promise<boolean> => {
+    /** Recognizes nonempty textual payment fields. */
+    const text = (value: unknown): value is string =>
+      typeof value === 'string' && value.trim().length > 0;
+    /** Recognizes nonnegative safe integer payment fields. */
+    const natural = (value: unknown): value is number =>
+      typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+    /** Recognizes canonical lowercase chain identifiers. */
+    const chain = (value: unknown): value is string =>
+      typeof value === 'string' && /^[a-z][a-z0-9-]*$/.test(value);
+    const protocolFields = [
+      'height',
+      'fromChain',
+      'toChain',
+      'fromAddress',
+      'toAddress',
+      'amount',
+      'bridgeFee',
+      'networkFee',
+      'sourceChainTokenId',
+      'targetChainTokenId',
+      'sourceTxId',
+      'sourceChainHeight',
+      'sourceBlockId',
+      'WIDsHash',
+      'WIDsCount',
+      'id',
+      'txId',
+      'eventId',
+    ] as const;
+    const event = {
+      id: expectedEvent?.id,
+      status: expectedEvent?.status,
+      firstTry: expectedEvent?.firstTry,
+      unexpectedFails: expectedEvent?.unexpectedFails,
+    };
+    const data = Object.fromEntries(
+      protocolFields.map((field) => [field, expectedEvent?.eventData?.[field]]),
+    ) as Pick<EventTriggerEntity, (typeof protocolFields)[number]>;
+    const tx = {
+      txId: paymentTx.txId,
+      chain: paymentTx.network,
+      type: paymentTx.txType,
+      eventId: paymentTx.eventId,
+      bytes: Buffer.from(paymentTx.txBytes).toString('hex'),
+      txJson: paymentTx.toJson(),
+    };
+    const model: unknown = JSON.parse(tx.txJson);
+    if (!model || typeof model !== 'object' || Array.isArray(model))
+      throw new Error('Invalid synchronized payment model');
+    const serialized = model as Record<string, unknown>;
+    for (const field of ['inputBoxes', 'dataInputs'] as const) {
+      const boxes = (
+        paymentTx as PaymentTransaction & {
+          inputBoxes?: Uint8Array[];
+          dataInputs?: Uint8Array[];
+        }
+      )[field];
+      if (tx.chain === 'ergo' || boxes !== undefined || field in serialized) {
+        if (
+          !Array.isArray(boxes) ||
+          !boxes.every((box) => box instanceof Uint8Array) ||
+          JSON.stringify(serialized[field]) !==
+            JSON.stringify(boxes.map((box) => Buffer.from(box).toString('hex')))
+        )
+          throw new Error('Invalid synchronized payment auxiliary bytes');
+      }
+    }
+    if (
+      !text(tx.txId) ||
+      !chain(tx.chain) ||
+      !/^(?:[0-9a-f]{2})+$/.test(tx.bytes) ||
+      tx.type !== TransactionType.payment ||
+      serialized.txId !== tx.txId ||
+      serialized.network !== tx.chain ||
+      serialized.txType !== tx.type ||
+      serialized.eventId !== tx.eventId ||
+      serialized.txBytes !== tx.bytes ||
+      !text(event.id) ||
+      event.status !== EventStatus.pendingPayment ||
+      (event.firstTry !== null && typeof event.firstTry !== 'string') ||
+      !natural(event.unexpectedFails) ||
+      !natural(requiredSign) ||
+      requiredSign < 1 ||
+      !natural(currentHeight) ||
+      (assertAuthority !== undefined &&
+        typeof assertAuthority !== 'function') ||
+      protocolFields.some((field) =>
+        ['id', 'height', 'sourceChainHeight', 'WIDsCount'].includes(field)
+          ? !natural(data[field])
+          : typeof data[field] !== 'string',
+      ) ||
+      data.id < 1 ||
+      !text(data.txId) ||
+      !text(data.sourceTxId) ||
+      !chain(data.fromChain) ||
+      !chain(data.toChain) ||
+      tx.chain !== data.toChain ||
+      tx.eventId !== event.id ||
+      data.eventId !== event.id ||
+      Utils.txIdToEventId(data.sourceTxId) !== event.id
+    )
+      throw new Error('Invalid synchronized payment preimage');
+    const now = String(Math.round(Date.now() / 1000));
+    const status =
+      tx.chain === 'ergo' ? EventStatus.completed : EventStatus.pendingReward;
+    const conflict = new Error('Synchronized payment CAS conflict');
+    try {
+      await this.dataSource.transaction(async (manager) => {
+        const events = manager.getRepository(ConfirmedEventEntity);
+        const transactions = manager.getRepository(TransactionEntity);
+        const current = await events.findOne({
+          where: { id: event.id },
+          relations: ['eventData'],
+        });
+        if (
+          !current ||
+          current.status !== event.status ||
+          current.firstTry !== event.firstTry ||
+          current.unexpectedFails !== event.unexpectedFails ||
+          !current.eventData ||
+          protocolFields.some(
+            (field) => current.eventData[field] !== data[field],
+          ) ||
+          (await transactions.existsBy({ txId: tx.txId })) ||
+          (await transactions.existsBy({
+            event: { id: event.id },
+            type: TransactionType.payment,
+            status: Not(TransactionStatus.invalid),
+          }))
+        )
+          throw conflict;
+        const inserted = {
+          txId: tx.txId,
+          txJson: tx.txJson,
+          chain: tx.chain,
+          type: tx.type,
+          status: TransactionStatus.completed,
+          lastStatusUpdate: now,
+          lastCheck: currentHeight,
+          event: { id: event.id },
+          order: null,
+          failedInSign: false,
+          signFailedCount: 0,
+          requiredSign,
+        };
+        // Authorize after acquiring the SQL owner, not before its wait queue.
+        assertAuthority?.();
+        await transactions.insert(inserted);
+        // SQLite BEFORE INSERT IGNORE does not report an affected-row count.
+        if (!(await transactions.existsBy({ ...inserted, order: IsNull() })))
+          throw conflict;
+        assertAuthority?.();
+        const trigger = manager
+          .getRepository(EventTriggerEntity)
+          .createQueryBuilder('trigger')
+          .select('1');
+        for (const field of protocolFields) {
+          trigger.andWhere(`trigger.${field} = :sync_${field}`, {
+            [`sync_${field}`]: data[field],
+          });
+        }
+        const changed = await events
+          .createQueryBuilder()
+          .update()
+          .set({
+            status,
+            ...(status === EventStatus.pendingReward ? { firstTry: now } : {}),
+          })
+          .where({
+            ...event,
+            firstTry: event.firstTry === null ? IsNull() : event.firstTry,
+            eventData: { id: data.id },
+          })
+          .andWhere(`EXISTS (${trigger.getQuery()})`, trigger.getParameters())
+          .execute();
+        if (changed.affected !== 1) throw conflict;
+      });
+    } catch (error) {
+      if (error === conflict) return false;
+      throw error;
+    }
+    PublicStatusHandler.getInstance().updatePublicTxStatus(
+      tx.txId,
+      TransactionStatus.completed,
+    );
+    PublicStatusHandler.getInstance().updatePublicEventStatus(event.id, status);
+    return true;
   };
 
   /**
@@ -1145,7 +1981,7 @@ class DatabaseAction {
    */
   getChainAddressBalanceByAddresses = async (
     addresses: string[],
-    chain?: string,
+    chain?: string | readonly string[],
     tokenId?: string,
     offset?: number,
     limit?: number,
@@ -1154,7 +1990,9 @@ class DatabaseAction {
       await this.ChainAddressBalanceRepository.findAndCount({
         where: {
           address: In(addresses),
-          ...(chain ? { chain } : {}),
+          ...(chain
+            ? { chain: typeof chain === 'string' ? chain : In([...chain]) }
+            : {}),
           ...(tokenId ? { tokenId } : {}),
         },
         ...(Number.isFinite(offset) ? { skip: offset } : {}),
