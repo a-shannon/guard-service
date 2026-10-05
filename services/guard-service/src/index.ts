@@ -1,14 +1,18 @@
 import './bootstrap';
 
+import config from 'config';
+
 import { MultiSigUtils } from '@rosen-bridge/ergo-multi-sig';
 
 import TxAgreement from './agreement/txAgreement';
 import ArbitraryProcessor from './arbitrary/arbitraryProcessor';
 import RosenDialer from './communication/rosenDialer';
+import { readAvalancheBalanceConfig } from './configs/avalancheBalanceConfig';
 import Configs from './configs/configs';
 import { DatabaseAction } from './db/databaseAction';
 import DatabaseHandler from './db/databaseHandler';
 import { dataSource } from './db/dataSource';
+import { getHealthCheck } from './guard/healthCheck';
 import BalanceHandler from './handlers/balanceHandler';
 import ChainHandler from './handlers/chainHandler';
 import DetectionHandler from './handlers/detectionHandler';
@@ -24,10 +28,11 @@ import { initDataSources } from './jobs/dataSources';
 import { configUpdateJob } from './jobs/guardConfigUpdate';
 import { healthCheckStart } from './jobs/healthCheck';
 import {
-  initScanner,
   getAvalancheScanner,
+  initScanner,
   prepareAvalancheScanner,
   getPreparedAvalancheInputs,
+  startScannerJobs,
 } from './jobs/initScanner';
 import { minimumFeeUpdateJob } from './jobs/minimumFee';
 import { initializeMultiSigJobs } from './jobs/multiSig';
@@ -95,9 +100,6 @@ const init = async () => {
   // initialize Dialer
   await RosenDialer.init();
 
-  // initialize express Apis
-  await initApiServer();
-
   // initialize DetectionHandler
   await DetectionHandler.init();
 
@@ -107,20 +109,20 @@ const init = async () => {
   );
   // initialize tss multiSig object
   await MultiSigHandler.init(multiSigUtils, signing);
-  initializeMultiSigJobs();
 
   // start tss instance
   await TssHandler.init(signing);
-  tssUpdateJob();
 
   // initialize chain objects
-  ChainHandler.getInstance();
+  await ChainHandler.initialize();
+
+  // Register every extractor before exposing APIs or starting recurring work.
+  await initScanner();
 
   // guard config update job
   const pkHandler = GuardPkHandler.getInstance();
   await pkHandler.update();
   pkHandler.updateDependentModules();
-  setTimeout(configUpdateJob, Configs.guardConfigUpdateInterval * 1000);
 
   // initialize TxAgreement object
   await TxAgreement.getInstance();
@@ -136,13 +138,27 @@ const init = async () => {
 
   // initialize MinimumFeeHandler
   await MinimumFeeHandler.init(TokenHandler.getInstance().getTokenMap());
-  minimumFeeUpdateJob();
 
   // initialize BalanceHandler
-  BalanceHandler.init();
+  BalanceHandler.init(
+    avalancheInputs
+      ? readAvalancheBalanceConfig(
+          config.has('balanceHandler.avalanche')
+            ? config.get('balanceHandler.avalanche')
+            : undefined,
+        )
+      : undefined,
+  );
 
-  // run network scanners
-  initScanner();
+  // Validate and register all health parameters before exposing APIs or timers.
+  await getHealthCheck();
+
+  await initApiServer();
+  initializeMultiSigJobs();
+  tssUpdateJob();
+  setTimeout(configUpdateJob, Configs.guardConfigUpdateInterval * 1000);
+  minimumFeeUpdateJob();
+  startScannerJobs();
 
   // run processors
   runProcessors();
@@ -154,4 +170,4 @@ const init = async () => {
   await revenueJob();
 };
 
-init().then(() => null);
+export const initialization = init();
