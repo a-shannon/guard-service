@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "rootDir": "./lib" },
+  "exclude": ["tests", "vitest.config.ts"],
+  "references": [
+    { "path": "../../abstract-chain/tsconfig.build.json" },
+    { "path": "../evm/tsconfig.build.json" },
+    { "path": "../../networks/avalanche-rpc/tsconfig.build.json" }
+  ]
+}

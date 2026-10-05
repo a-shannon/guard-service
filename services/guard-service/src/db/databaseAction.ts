@@ -569,7 +569,7 @@ class DatabaseAction {
     if (
       expected.status !== TransactionStatus.signFailed ||
       expected.type !== TransactionType.payment ||
-      expected.chain !== 'ergo' ||
+      !['ergo', 'avalanche'].includes(expected.chain) ||
       expected.eventId === null ||
       expected.orderId !== null ||
       typeof signedJson !== 'string' ||
@@ -638,6 +638,111 @@ class DatabaseAction {
         });
         if (JSON.stringify(currentEvent) !== eventSnapshot)
           throw new Error('Payment recovery event postcondition failed');
+        assertActive();
+        return true;
+      });
+    } catch (error) {
+      if (error === conflict) return false;
+      throw error;
+    }
+    if (recovered)
+      PublicStatusHandler.getInstance().updatePublicTxStatus(
+        expected.txId,
+        TransactionStatus.sent,
+      );
+    return recovered;
+  };
+
+  /** Restores exact signed native management bytes after qualified observed execution. */
+  recoverSignedManagementIfUnchanged = async (
+    input: TransactionCheckPreimage,
+    signedJson: string,
+    authorization: SigningPersistenceAuthorization,
+  ): Promise<boolean> => {
+    const expected = Object.freeze({ ...input });
+    const predicate = this.txCheckPredicate(expected);
+    const arbitrary = expected.type === TransactionType.arbitrary;
+    if (
+      expected.chain !== 'avalanche' ||
+      expected.status !== TransactionStatus.signFailed ||
+      ![
+        TransactionType.coldStorage,
+        TransactionType.manual,
+        TransactionType.arbitrary,
+      ].includes(expected.type as TransactionType) ||
+      expected.eventId !== null ||
+      (arbitrary ? !expected.orderId : expected.orderId !== null) ||
+      typeof signedJson !== 'string' ||
+      !authorization ||
+      typeof authorization.assertActive !== 'function' ||
+      typeof authorization.assertBefore !== 'function' ||
+      typeof authorization.assertAfter !== 'function'
+    )
+      throw new Error(
+        'Invalid native management recovery preimage or authority',
+      );
+    const model = JSON.parse(signedJson);
+    if (
+      !model ||
+      typeof model !== 'object' ||
+      Array.isArray(model) ||
+      model.network !== expected.chain ||
+      model.txId !== expected.txId ||
+      model.txType !== expected.type ||
+      model.eventId !== (arbitrary ? expected.orderId : '') ||
+      typeof model.txBytes !== 'string' ||
+      !/^(?:[0-9a-f]{2})+$/.test(model.txBytes)
+    )
+      throw new Error('Invalid native management recovery signed model');
+    const assertActive = authorization.assertActive.bind(authorization);
+    const assertBefore = authorization.assertBefore.bind(authorization);
+    const assertAfter = authorization.assertAfter.bind(authorization);
+    const conflict = new Error('Native management recovery CAS conflict');
+    let recovered: boolean;
+    try {
+      recovered = await this.dataSource.transaction(async (manager) => {
+        assertActive();
+        const repository = manager.getRepository(TransactionEntity);
+        if (!(await repository.existsBy(predicate))) return false;
+        const orders = manager.getRepository(ArbitraryEntity);
+        const order = arbitrary
+          ? await orders.findOneBy({ id: expected.orderId! })
+          : null;
+        if (
+          arbitrary &&
+          (!order ||
+            order.chain !== expected.chain ||
+            order.status !== OrderStatus.inProcess)
+        )
+          throw new Error('Invalid native management recovery order');
+        const orderSnapshot = JSON.stringify(order);
+        await assertBefore(manager, expected);
+        assertActive();
+        const after = Object.freeze({
+          ...expected,
+          txJson: signedJson,
+          status: TransactionStatus.sent,
+          lastStatusUpdate: String(Math.round(Date.now() / 1000)),
+        });
+        const result = await repository.update(predicate, {
+          txJson: after.txJson,
+          status: after.status,
+          lastStatusUpdate: after.lastStatusUpdate,
+        });
+        if (result.affected !== 1) throw conflict;
+        await assertAfter(manager, after);
+        if (!(await repository.existsBy(this.txCheckPredicate(after))))
+          throw new Error(
+            'Native management recovery row postcondition failed',
+          );
+        if (
+          arbitrary &&
+          JSON.stringify(await orders.findOneBy({ id: expected.orderId! })) !==
+            orderSnapshot
+        )
+          throw new Error(
+            'Native management recovery order postcondition failed',
+          );
         assertActive();
         return true;
       });

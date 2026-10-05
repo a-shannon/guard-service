@@ -1,4 +1,5 @@
 import { DefaultLogger } from '@rosen-bridge/abstract-logger';
+import { AvalancheRpcScanner } from '@rosen-bridge/evm-scanner';
 import { ChainMinimumFee } from '@rosen-bridge/minimum-fee';
 import {
   EventTrigger,
@@ -17,10 +18,12 @@ import ChainHandler from '../handlers/chainHandler';
 import GuardPkHandler from '../handlers/guardPkHandler';
 import MinimumFeeHandler from '../handlers/minimumFeeHandler';
 import { NotificationHandler } from '../handlers/notificationHandler';
+import { getAvalancheScanner } from '../jobs/initScanner';
 import * as TransactionSerializer from '../transaction/transactionSerializer';
 import { EventStatus, EventUnexpectedFailsLimit } from '../utils/constants';
 import GuardTurn from '../utils/guardTurn';
 import EventVerifier from '../verification/eventVerifier';
+import RewardAuthorization from '../verification/rewardAuthorization';
 import EventBoxes from './eventBoxes';
 import EventOrder from './eventOrder';
 import EventSerializer from './eventSerializer';
@@ -37,37 +40,91 @@ class EventProcessor {
     const rawEvents = await dbAction.getUnconfirmedEvents();
     for (const event of rawEvents) {
       try {
-        // check if event is confirmed enough
+        // Keep one protocol and database identity across the asynchronous checks.
+        const eventData = Object.freeze({ ...event });
+        const protocolEvent = Object.freeze(
+          EventSerializer.fromEntity(eventData),
+        );
         if (
-          await EventVerifier.isEventConfirmedEnough(
-            EventSerializer.fromEntity(event),
+          [protocolEvent.fromChain, protocolEvent.toChain].some(
+            (chain) =>
+              chain.trim().toLowerCase() === 'avalanche' &&
+              chain !== 'avalanche',
           )
-        ) {
-          // check if any other valid trigger is confirmed and verified for this event
-          const eventEntity = await dbAction.getEventById(event.eventId);
-          if (eventEntity && eventEntity.eventData.id !== event.id) {
-            logger.warn(
-              `Event [${event.eventId}] is already confirmed and verified in tx [${eventEntity.eventData.txId}]. Marking trigger tx [${event.txId}] as rejected`,
-            );
-            await dbAction.insertRejectedEvent(event, 'duplicate-trigger');
-          } else {
-            // get minimum-fee and verify event
-            const feeConfig = MinimumFeeHandler.getEventFeeConfig(event);
-            // verify event
-            if (await EventVerifier.verifyEvent(event, event.txId, feeConfig)) {
-              logger.info(
-                `Event [${event.eventId}] with txId [${event.sourceTxId}] is confirmed and verified`,
+        )
+          throw new Error('Avalanche event chain identity is not canonical');
+        /** Rejects changes to the scanned event captured for this admission. */
+        const assertUnchanged = () => {
+          if (
+            event.id !== eventData.id ||
+            event.eventId !== eventData.eventId ||
+            event.txId !== eventData.txId ||
+            Object.entries(protocolEvent).some(
+              ([field, value]) => event[field as keyof EventTrigger] !== value,
+            )
+          )
+            throw new Error('Scanned event changed during admission');
+        };
+        /** Runs event admission with the captured source observation checks. */
+        const admit = async () => {
+          assertUnchanged();
+          // Check confirmation and verification under the same scanner lease.
+          if (await EventVerifier.isEventConfirmedEnough(protocolEvent)) {
+            const eventEntity = await dbAction.getEventById(eventData.eventId);
+            if (eventEntity && eventEntity.eventData.id !== eventData.id) {
+              assertUnchanged();
+              logger.warn(
+                `Event [${eventData.eventId}] is already confirmed and verified in tx [${eventEntity.eventData.txId}]. Marking trigger tx [${eventData.txId}] as rejected`,
               );
-              await dbAction.insertConfirmedEvent(event);
-            } else {
-              logger.warn(`Event [${event.eventId}] hasn't verified`);
               await dbAction.insertRejectedEvent(
-                event,
-                'unknown', // TODO: update rosen-chains to return reason
+                eventData,
+                'duplicate-trigger',
               );
+            } else {
+              const feeConfig =
+                MinimumFeeHandler.getEventFeeConfig(protocolEvent);
+              if (
+                await EventVerifier.verifyEvent(
+                  protocolEvent,
+                  eventData.txId,
+                  feeConfig,
+                )
+              ) {
+                assertUnchanged();
+                logger.info(
+                  `Event [${eventData.eventId}] with txId [${protocolEvent.sourceTxId}] is confirmed and verified`,
+                );
+                await dbAction.insertConfirmedEvent(eventData);
+              } else {
+                assertUnchanged();
+                logger.warn(`Event [${eventData.eventId}] hasn't verified`);
+                await dbAction.insertRejectedEvent(
+                  eventData,
+                  'unknown', // TODO: update rosen-chains to return reason
+                );
+              }
             }
-          }
-        } else logger.debug(`Event [${event.eventId}] is not confirmed yet`);
+          } else
+            logger.debug(`Event [${eventData.eventId}] is not confirmed yet`);
+        };
+        const source = protocolEvent.fromChain === 'avalanche';
+        const destination = protocolEvent.toChain === 'avalanche';
+        if (source || destination) {
+          if (EventSerializer.getId(protocolEvent) !== eventData.eventId)
+            throw new Error(
+              'Avalanche event identity does not match source tx',
+            );
+          const scanner = getAvalancheScanner();
+          if (!(scanner instanceof AvalancheRpcScanner))
+            throw new Error('Avalanche event requires its dedicated scanner');
+          if (source)
+            await scanner.withObservation(
+              protocolEvent.sourceChainHeight,
+              protocolEvent.sourceBlockId,
+              admit,
+            );
+          else await scanner.withSafety(admit);
+        } else await admit();
       } catch (e) {
         logger.warn(
           `An error occurred while processing event triggered in tx [${event.sourceTxId}]: ${e}`,
@@ -282,6 +339,39 @@ class EventProcessor {
     event: EventTrigger,
     eventTxId: string,
   ): Promise<void> => {
+    if (RewardAuthorization.applies(event)) {
+      const authorization = await RewardAuthorization.getInstance().bind(
+        event,
+        eventTxId,
+      );
+      const captured = authorization.event;
+      const inputs = await RewardAuthorization.getInstance().captureOrderInputs(
+        captured,
+        authorization.eventTxId,
+      );
+      // Failed generation leaves the captured pending event unchanged.
+      const tx = await this.createEventRewardDistribution(
+        captured,
+        authorization.eventTxId,
+        inputs.feeConfig,
+        authorization.paymentTxId,
+        inputs.eventWIDs,
+      );
+      const reward = RewardAuthorization.captureReward(
+        tx,
+        EventSerializer.getId(captured),
+      );
+      const agreement = await TxAgreement.getInstance();
+      await authorization.withAction(() => {
+        inputs.assertFee();
+        reward.assertUnchanged();
+        if (GuardTurn.guardTurn() === GuardPkHandler.getInstance().guardId) {
+          reward.retainAuthority(authorization);
+          agreement.addTransactionToQueue(reward.payment);
+        }
+      }, inputs.assertInputs);
+      return;
+    }
     const eventId = EventSerializer.getId(event);
     logger.info(`Processing event [${eventId}] for reward distribution`);
 
@@ -351,6 +441,7 @@ class EventProcessor {
     eventTxId: string,
     feeConfig: ChainMinimumFee,
     paymentTxId: string,
+    capturedWIDs?: readonly string[],
   ): Promise<PaymentTransaction> => {
     const ergoChain = ChainHandler.getInstance().getErgoChain();
 
@@ -358,7 +449,9 @@ class EventProcessor {
     const eventBox = await EventBoxes.getEventBox(eventTxId);
     const rwtCount = ergoChain.getBoxRWT(eventBox) / BigInt(event.WIDsCount);
 
-    const eventWIDs = await EventBoxes.getEventWIDs(event);
+    const eventWIDs = capturedWIDs
+      ? [...capturedWIDs]
+      : await EventBoxes.getEventWIDs(event);
     const commitmentBoxes = await EventBoxes.getEventValidCommitments(
       event,
       rwtCount,

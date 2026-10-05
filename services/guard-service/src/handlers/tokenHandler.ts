@@ -7,12 +7,16 @@ import {
   TokenMap,
 } from '@rosen-bridge/tokens';
 
-/** Preserve TokenMap update behavior while releasing the lease on every exit. */
+/** The installed TokenMap readers retain their API; only startup sealing is added. */
 class StartupTokenMap extends TokenMap {
+  #sealed = false;
+
   /** Applies token partitions and callbacks while releasing the update lease on every outcome. */
   override updateConfigByJson = async (tokens: RosenTokens): Promise<void> => {
     const release = await this.updateSemaphore.acquire();
     try {
+      if (this.#sealed)
+        throw new Error('Avalanche startup token map is sealed');
       const bridgeable: RosenTokens = [];
       const unbridgeable: RosenTokens = [];
       // Keep the partition rules of tokens 6.0.2, releasing even on malformed
@@ -32,6 +36,45 @@ class StartupTokenMap extends TokenMap {
       this.tokensConfig = bridgeable;
       this.unbridgeableTokens = unbridgeable;
       for (const callback of this.callbacks.values()) callback();
+    } finally {
+      release();
+    }
+  };
+
+  /** Serializes startup sealing with token updates and freezes the captured token partitions. */
+  sealForAvalanche = async (): Promise<void> => {
+    const release = await this.updateSemaphore.acquire();
+    try {
+      if (this.#sealed) return;
+      const seen = new WeakSet<object>();
+      /** Freezes nested token data once per object, including cyclic references. */
+      const freeze = (value: unknown): void => {
+        if (value === null || typeof value !== 'object' || seen.has(value))
+          return;
+        seen.add(value);
+        for (const member of Object.values(value)) freeze(member);
+        Object.freeze(value);
+      };
+      freeze(this.tokensConfig);
+      freeze(this.unbridgeableTokens);
+      for (const key of [
+        'tokensConfig',
+        'unbridgeableTokens',
+        'updateConfigByJson',
+      ] as const)
+        Object.defineProperty(this, key, {
+          writable: false,
+          configurable: false,
+        });
+      // Readers must not be replaced with views that disagree with the sealed
+      // storage. Lock method bindings, leaving operational state mutable.
+      for (const [key, value] of Object.entries(this))
+        if (typeof value === 'function')
+          Object.defineProperty(this, key, {
+            writable: false,
+            configurable: false,
+          });
+      this.#sealed = true;
     } finally {
       release();
     }
@@ -79,6 +122,19 @@ class TokenHandler {
    */
   getTokenMap = (): TokenMap => {
     return this.tokenMap;
+  };
+
+  /** Explicit startup opt-in; no job or configuration flag invokes it implicitly. */
+  sealForAvalanche = async (): Promise<void> => {
+    Object.defineProperty(this, 'tokenMap', {
+      writable: false,
+      configurable: false,
+    });
+    Object.defineProperty(this, 'getTokenMap', {
+      writable: false,
+      configurable: false,
+    });
+    await this.tokenMap.sealForAvalanche();
   };
 }
 

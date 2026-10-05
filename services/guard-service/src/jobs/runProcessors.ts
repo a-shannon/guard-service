@@ -10,7 +10,6 @@ import BalanceHandler from '../handlers/balanceHandler';
 import DetectionHandler from '../handlers/detectionHandler';
 import EventSynchronization from '../synchronization/eventSynchronization';
 import TransactionProcessor from '../transaction/transactionProcessor';
-import { ChainConfigKey, SUPPORTED_CHAINS } from '../utils/constants';
 import GuardTurn from '../utils/guardTurn';
 import IntervalTimer from '../utils/intervalTimer';
 
@@ -146,20 +145,20 @@ const detectionUpdateJob = () => {
  * runs Balance update job
  */
 const balanceUpdateJob = () => {
-  for (const chain of SUPPORTED_CHAINS) {
-    new IntervalTimer(
-      Configs.balanceHandler[ChainConfigKey[chain]].updateInterval * 1000,
-      async () => {
-        try {
-          await BalanceHandler.getInstance().updateChainBalances(chain);
-        } catch (error) {
-          logger.error(
-            `Balance update job of chain [${chain}] failed with error: ${error}`,
-          );
-          if (error.stack) logger.error(error.stack);
-        }
-      },
-    ).start();
+  for (const {
+    chain,
+    intervalMs,
+  } of BalanceHandler.getInstance().getUpdateSchedule()) {
+    new IntervalTimer(intervalMs, async () => {
+      try {
+        await BalanceHandler.getInstance().updateChainBalances(chain);
+      } catch (error) {
+        logger.error(
+          `Balance update job of chain [${chain}] failed with error: ${error}`,
+        );
+        if (error.stack) logger.error(error.stack);
+      }
+    }).start();
   }
 };
 

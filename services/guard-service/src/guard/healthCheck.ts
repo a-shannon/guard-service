@@ -6,6 +6,7 @@ import {
   ErgoExplorerAssetHealthCheckParam,
   ErgoNodeAssetHealthCheckParam,
   EvmRpcAssetHealthCheckParam,
+  AvalancheRpcAssetHealthCheckParam,
 } from '@rosen-bridge/asset-check';
 import {
   EventInfo,
@@ -21,6 +22,8 @@ import {
   TxProgressHealthCheckParam,
 } from '@rosen-bridge/tx-progress-check';
 import { NotFoundError } from '@rosen-chains/abstract-chain';
+import { AvalancheChain } from '@rosen-chains/avalanche';
+import { AvalancheRpcNetwork } from '@rosen-chains/avalanche-rpc';
 import { BINANCE_CHAIN, BNB } from '@rosen-chains/binance';
 import { BITCOIN_CHAIN, BTC } from '@rosen-chains/bitcoin';
 import { BITCOIN_RUNES_CHAIN } from '@rosen-chains/bitcoin-runes';
@@ -40,7 +43,13 @@ import GuardsErgoConfigs from '../configs/guardsErgoConfigs';
 import GuardsEthereumConfigs from '../configs/guardsEthereumConfigs';
 import { rosenConfig } from '../configs/rosenConfig';
 import { DatabaseAction } from '../db/databaseAction';
+import ChainHandler from '../handlers/chainHandler';
 import { NotificationHandler } from '../handlers/notificationHandler';
+import { TokenHandler } from '../handlers/tokenHandler';
+import {
+  getAvalancheScanner,
+  getPreparedAvalancheInputs,
+} from '../jobs/initScanner';
 import {
   ADA_DECIMALS,
   ERG_DECIMALS,
@@ -49,6 +58,7 @@ import {
   BINANCE_BLOCK_TIME,
   ERGO_BLOCK_TIME,
 } from '../utils/constants';
+import { AvalancheScannerHealthCheckParam } from './avalancheHealthCheck';
 
 const logger = DefaultLogger.getInstance().child(import.meta.url);
 let healthCheck: HealthCheck | undefined;
@@ -77,7 +87,7 @@ const getHealthCheck = async () => {
         },
       },
     };
-    healthCheck = new HealthCheck(
+    const candidate = new HealthCheck(
       notificationHandler.notify,
       notificationConfig,
     );
@@ -102,7 +112,7 @@ const getHealthCheck = async () => {
       Configs.txSignFailedWarnThreshold,
       Configs.txSignFailedCriticalThreshold,
     );
-    healthCheck.register(txProgressHealthCheck);
+    candidate.register(txProgressHealthCheck);
 
     // add EventProgress param
     const getActiveEvents = async (): Promise<EventInfo[]> => {
@@ -122,7 +132,7 @@ const getHealthCheck = async () => {
       Configs.eventDurationWarnThreshold,
       Configs.eventDurationCriticalThreshold,
     );
-    healthCheck.register(eventProgressHealthCheck);
+    candidate.register(eventProgressHealthCheck);
 
     const ergoContracts = rosenConfig.contractReader(ERGO_CHAIN);
     const cardanoContracts = rosenConfig.contractReader(CARDANO_CHAIN);
@@ -163,7 +173,7 @@ const getHealthCheck = async () => {
         GuardsErgoConfigs.node.url,
         ERG_DECIMALS,
       );
-      healthCheck.register(ergAssetHealthCheck);
+      candidate.register(ergAssetHealthCheck);
 
       const emissionTokenAssetHealthCheck = new ErgoNodeAssetHealthCheckParam(
         GuardsErgoConfigs.emissionTokenId,
@@ -174,7 +184,7 @@ const getHealthCheck = async () => {
         GuardsErgoConfigs.node.url,
         GuardsErgoConfigs.emissionTokenDecimal,
       );
-      healthCheck.register(emissionTokenAssetHealthCheck);
+      candidate.register(emissionTokenAssetHealthCheck);
 
       const ergoScannerSyncCheck = new ScannerSyncHealthCheckParam(
         ERGO_CHAIN,
@@ -184,7 +194,7 @@ const getHealthCheck = async () => {
         ERGO_BLOCK_TIME,
         GuardsErgoConfigs.scannerInterval,
       );
-      healthCheck.register(ergoScannerSyncCheck);
+      candidate.register(ergoScannerSyncCheck);
 
       const ergoNodeSyncCheck = new ErgoNodeSyncHealthCheckParam(
         Configs.ergoNodeMaxHeightDiff,
@@ -193,7 +203,7 @@ const getHealthCheck = async () => {
         Configs.ergoNodeMaxPeerHeightDifference,
         GuardsErgoConfigs.node.url,
       );
-      healthCheck.register(ergoNodeSyncCheck);
+      candidate.register(ergoNodeSyncCheck);
     } else if (GuardsErgoConfigs.chainNetworkName === EXPLORER_NETWORK) {
       const ergAssetHealthCheck = new ErgoExplorerAssetHealthCheckParam(
         ERG,
@@ -204,7 +214,7 @@ const getHealthCheck = async () => {
         GuardsErgoConfigs.explorer.url,
         ERG_DECIMALS,
       );
-      healthCheck.register(ergAssetHealthCheck);
+      candidate.register(ergAssetHealthCheck);
 
       const emissionTokenAssetHealthCheck =
         new ErgoExplorerAssetHealthCheckParam(
@@ -216,7 +226,7 @@ const getHealthCheck = async () => {
           GuardsErgoConfigs.explorer.url,
           GuardsErgoConfigs.emissionTokenDecimal,
         );
-      healthCheck.register(emissionTokenAssetHealthCheck);
+      candidate.register(emissionTokenAssetHealthCheck);
 
       const ergoScannerSyncCheck = new ScannerSyncHealthCheckParam(
         ERGO_CHAIN,
@@ -226,7 +236,7 @@ const getHealthCheck = async () => {
         ERGO_BLOCK_TIME,
         GuardsErgoConfigs.scannerInterval,
       );
-      healthCheck.register(ergoScannerSyncCheck);
+      candidate.register(ergoScannerSyncCheck);
     }
     if (GuardsCardanoConfigs.chainNetworkName === KOIOS_NETWORK) {
       const adaAssetHealthCheck = new CardanoKoiosAssetHealthCheckParam(
@@ -239,7 +249,7 @@ const getHealthCheck = async () => {
         ADA_DECIMALS,
         GuardsCardanoConfigs.koios.authToken,
       );
-      healthCheck.register(adaAssetHealthCheck);
+      candidate.register(adaAssetHealthCheck);
     } else if (GuardsCardanoConfigs.chainNetworkName === BLOCKFROST_NETWORK) {
       const adaAssetHealthCheck = new CardanoBlockFrostAssetHealthCheckParam(
         ADA,
@@ -251,7 +261,7 @@ const getHealthCheck = async () => {
         ADA_DECIMALS,
         GuardsCardanoConfigs.blockfrost.url,
       );
-      healthCheck.register(adaAssetHealthCheck);
+      candidate.register(adaAssetHealthCheck);
     }
     if (GuardsBitcoinConfigs.chainNetworkName === 'esplora') {
       // register BTC asset-check on Bitcoin lock address
@@ -264,7 +274,7 @@ const getHealthCheck = async () => {
         GuardsBitcoinConfigs.esplora.url,
         8,
       );
-      healthCheck.register(btcAssetHealthCheck);
+      candidate.register(btcAssetHealthCheck);
       // register BTC asset-check on Bitcoin Runes lock address
       const btcRunesAssetHealthCheck = new EsploraAssetHealthCheckParam(
         BITCOIN_RUNES_CHAIN,
@@ -275,7 +285,7 @@ const getHealthCheck = async () => {
         GuardsBitcoinConfigs.esplora.url,
         8,
       );
-      healthCheck.register(btcRunesAssetHealthCheck);
+      candidate.register(btcRunesAssetHealthCheck);
     }
     if (GuardsEthereumConfigs.chainNetworkName === 'rpc') {
       const ethAssetHealthCheck = new EvmRpcAssetHealthCheckParam(
@@ -291,7 +301,7 @@ const getHealthCheck = async () => {
         GuardsEthereumConfigs.rpc.authToken,
         18,
       );
-      healthCheck.register(ethAssetHealthCheck);
+      candidate.register(ethAssetHealthCheck);
 
       const ethereumScannerSyncCheck = new ScannerSyncHealthCheckParam(
         ETHEREUM_CHAIN,
@@ -301,7 +311,7 @@ const getHealthCheck = async () => {
         ETHEREUM_BLOCK_TIME,
         GuardsEthereumConfigs.rpc.scannerInterval,
       );
-      healthCheck.register(ethereumScannerSyncCheck);
+      candidate.register(ethereumScannerSyncCheck);
     }
     if (GuardsBinanceConfigs.chainNetworkName === 'rpc') {
       const bnbAssetHealthCheck = new EvmRpcAssetHealthCheckParam(
@@ -317,7 +327,7 @@ const getHealthCheck = async () => {
         GuardsBinanceConfigs.rpc.authToken,
         18,
       );
-      healthCheck.register(bnbAssetHealthCheck);
+      candidate.register(bnbAssetHealthCheck);
 
       const binanceScannerSyncCheck = new ScannerSyncHealthCheckParam(
         BINANCE_CHAIN,
@@ -327,7 +337,160 @@ const getHealthCheck = async () => {
         BINANCE_BLOCK_TIME,
         GuardsBinanceConfigs.rpc.scannerInterval,
       );
-      healthCheck.register(binanceScannerSyncCheck);
+      candidate.register(binanceScannerSyncCheck);
+    }
+
+    const avalancheInputs = getPreparedAvalancheInputs();
+    if (avalancheInputs) {
+      const thresholds = Configs.getAvalancheHealthConfig();
+      const scanner = getAvalancheScanner();
+      if (!scanner)
+        throw new Error('Avalanche health requires a registered scanner');
+      const chains = ChainHandler.getInstance();
+      const database = DatabaseAction.getInstance();
+      const chain = chains.getChain('avalanche') as AvalancheChain;
+      const network = chain.network as AvalancheRpcNetwork;
+      const assertNetwork = network.assertNetwork;
+      const withHealthRead = scanner.withHealthRead;
+      const nativeBalance = network.getAddressBalanceForNativeToken;
+      const tokenBalance = network.getAddressBalanceForERC20Asset;
+      const readLockBalance = chains.getAvalancheLockBalance;
+      /** Rechecks the exact registered custody source across each health read. */
+      const assertSource = () => {
+        if (
+          getAvalancheScanner() !== scanner ||
+          scanner.withHealthRead !== withHealthRead ||
+          chains.getChain('avalanche') !== chain ||
+          chain.network !== network ||
+          network.expectedChainId !== BigInt(avalancheInputs.config.chainId) ||
+          network.assertNetwork !== assertNetwork ||
+          network.getAddressBalanceForNativeToken !== nativeBalance ||
+          network.getAddressBalanceForERC20Asset !== tokenBalance ||
+          chains.getAvalancheLockBalance !== readLockBalance
+        )
+          throw new Error('Avalanche asset health source changed');
+      };
+      /** Holds scanner exclusion for raw custody reads and refuses late source drift. */
+      const healthReadTimeoutMs = Math.ceil(
+        avalancheInputs.config.rpc.timeout * 1000,
+      );
+      const healthReadMaxPending = chain.supportedTokens.length + 2;
+      const qualified = <T>(read: () => Promise<T>) =>
+        withHealthRead(
+          async () => {
+            assertSource();
+            const value = await read();
+            assertSource();
+            return value;
+          },
+          healthReadTimeoutMs,
+          healthReadMaxPending,
+        );
+      const nativeHealth = new AvalancheRpcAssetHealthCheckParam(
+        {
+          chainId: avalancheInputs.config.chainId,
+          sourceId: avalancheInputs.config.sourceId,
+          address: avalancheInputs.contracts.addresses.lock,
+          warnThreshold: thresholds.nativeWarnWei,
+          criticalThreshold: thresholds.nativeCriticalWei,
+        },
+        {
+          expectedChainId: network.expectedChainId,
+          assertNetwork: async () => {
+            assertSource();
+            await assertNetwork.call(network);
+            assertSource();
+          },
+          getAddressBalanceForNativeToken: async () =>
+            qualified(() => readLockBalance.call(chains)),
+        },
+      );
+      // This Guard registers one native AVAX parameter; retain its monitoring ID.
+      nativeHealth.getId = () => 'avalanche-native-balance';
+      candidate.register(nativeHealth);
+      const selected = thresholds.tokens ?? [];
+      if (
+        selected.length !== chain.supportedTokens.length ||
+        selected.some((token) => !chain.supportedTokens.includes(token.tokenId))
+      )
+        throw new Error(
+          'Avalanche health requires thresholds for every mapped token',
+        );
+      for (const token of selected) {
+        const tokens = TokenHandler.getInstance().getTokenMap();
+        const matches = tokens.search('avalanche', { tokenId: token.tokenId });
+        if (matches.length !== 1 || typeof tokenBalance !== 'function')
+          throw new Error('Invalid Avalanche token health source');
+        const asset = matches[0].avalanche;
+        const metadata = JSON.stringify(asset);
+        const search = tokens.search;
+        /** Retains the selected map and asset metadata during qualified reads. */
+        const assertToken = () => {
+          assertSource();
+          if (
+            TokenHandler.getInstance().getTokenMap() !== tokens ||
+            tokens.search !== search ||
+            JSON.stringify(
+              search.call(tokens, 'avalanche', { tokenId: token.tokenId })[0]
+                ?.avalanche,
+            ) !== metadata
+          )
+            throw new Error('Avalanche token health map changed');
+        };
+        candidate.register(
+          new AvalancheRpcAssetHealthCheckParam(
+            {
+              chainId: avalancheInputs.config.chainId,
+              sourceId: avalancheInputs.config.sourceId,
+              address: avalancheInputs.contracts.addresses.lock,
+              warnThreshold: token.warnRaw,
+              criticalThreshold: token.criticalRaw,
+              token: {
+                tokenId: token.tokenId,
+                name: asset.name,
+                decimals: asset.decimals,
+              },
+            },
+            {
+              expectedChainId: network.expectedChainId,
+              assertNetwork: async () => {
+                assertToken();
+                await assertNetwork.call(network);
+                assertToken();
+              },
+              getAddressBalanceForNativeToken: async () =>
+                qualified(() => readLockBalance.call(chains)),
+              getAddressBalanceForERC20Asset: async (address, id) =>
+                qualified(async () => {
+                  assertToken();
+                  const value = await tokenBalance.call(network, address, id);
+                  assertToken();
+                  return value;
+                }),
+            },
+          ),
+        );
+      }
+      const lastSavedBlock = database.getLastSavedBlockForScanner;
+      /** Refuses late replacement of the database reader used by scanner health. */
+      const assertScannerHealthSource = () => {
+        assertSource();
+        if (
+          DatabaseAction.getInstance() !== database ||
+          database.getLastSavedBlockForScanner !== lastSavedBlock
+        )
+          throw new Error('Avalanche scanner health source changed');
+      };
+      candidate.register(
+        new AvalancheScannerHealthCheckParam(thresholds, () =>
+          qualified(async () => {
+            assertScannerHealthSource();
+            const value = await lastSavedBlock.call(database, 'avalanche');
+            assertScannerHealthSource();
+            return value;
+          }),
+        ),
+      );
     }
 
     // add LogLevel param
@@ -337,14 +500,15 @@ const getHealthCheck = async () => {
       Configs.logDuration,
       'warn',
     );
-    healthCheck.register(warnLogCheck);
+    candidate.register(warnLogCheck);
     const errorLogCheck = new LogLevelHealthCheck(
       HealthStatusLevel.UNSTABLE,
       Configs.errorLogAllowedCount,
       Configs.logDuration,
       'error',
     );
-    healthCheck.register(errorLogCheck);
+    candidate.register(errorLogCheck);
+    healthCheck = candidate;
   }
 
   return healthCheck;

@@ -2,6 +2,15 @@ import { PaymentOrder } from '@rosen-chains/abstract-chain';
 
 import GuardsErgoConfigs from '../../src/configs/guardsErgoConfigs';
 
+/** Synthetic transport details for the startup warning disclosure control. */
+export const avalancheTransportSentinels = [
+  'fixture-url-user',
+  'fixture-url-secret',
+  'fixture-header-token',
+] as const;
+export const avalancheTransportFailure =
+  'Transport failed https://fixture-url-user:fixture-url-secret@rpc.example.invalid/rpc Authorization: Bearer fixture-header-token';
+
 export const fraudTxOrder: PaymentOrder = [
   {
     address: GuardsErgoConfigs.ergoContractConfig.addresses.Fraud,

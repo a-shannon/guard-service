@@ -11,6 +11,10 @@ import { TokenHandler } from '../handlers/tokenHandler';
 import { BalanceHandlerConfig } from '../types/config';
 import { ConfigError } from '../utils/errors';
 import Utils from '../utils/utils';
+import {
+  AvalancheHealthConfig,
+  readAvalancheHealthConfig,
+} from './avalancheHealthConfig';
 
 /**
  * reads a numerical config, set default value if it does not exits
@@ -55,6 +59,14 @@ const getOptionalConfig = <T>(key: string, defaultValue: T) => {
 };
 
 class Configs {
+  /** Reads explicit Avalanche health policy when enabled startup reaches its health barrier. */
+  static getAvalancheHealthConfig = (): AvalancheHealthConfig =>
+    readAvalancheHealthConfig(
+      config.has('avalanche.healthCheck')
+        ? config.get('avalanche.healthCheck')
+        : undefined,
+    );
+
   // express config
   static apiPort = getConfigIntKeyOrDefault('api.port', 8080);
   static apiHost = getOptionalConfig<string>('api.host', 'localhost');

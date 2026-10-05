@@ -1,11 +1,13 @@
 import { DefaultLogger } from '@rosen-bridge/abstract-logger';
 import { FastifyWithZod } from '@rosen-bridge/fastify-enhanced';
+import { AVALANCHE_CHAIN } from '@rosen-chains/avalanche';
 
 import Configs from '../configs/configs';
 import DatabaseHandler from '../db/databaseHandler';
 import ChainHandler from '../handlers/chainHandler';
 import GuardPkHandler from '../handlers/guardPkHandler';
 import { authenticateKey } from '../utils/authentication';
+import { isAvalancheManagementRouteEnabled } from '../utils/avalancheManagementRoutes';
 import { DuplicateTransaction } from '../utils/errors';
 import { MessageResponseSchema, SignQuerySchema } from './schemas';
 
@@ -45,8 +47,22 @@ const signTxRoute = (server: FastifyWithZod) => {
         return;
       }
 
+      if (
+        chain === AVALANCHE_CHAIN &&
+        !isAvalancheManagementRouteEnabled('manual')
+      ) {
+        reply.status(400).send({
+          message: 'Avalanche manual transaction route is disabled',
+        });
+        return;
+      }
+
       const guardsLen = GuardPkHandler.getInstance().guardsLen;
-      if (requiredSign > guardsLen || requiredSign <= 0) {
+      if (
+        !Number.isSafeInteger(requiredSign) ||
+        requiredSign > guardsLen ||
+        requiredSign <= 0
+      ) {
         reply.status(400).send({
           message: `Invalid value for required sign (expected 1 to ${guardsLen}, found ${requiredSign})`,
         });

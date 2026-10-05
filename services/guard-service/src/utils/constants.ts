@@ -1,3 +1,4 @@
+import { AVALANCHE_CHAIN, AVAX } from '@rosen-chains/avalanche';
 import { BINANCE_CHAIN, BNB } from '@rosen-chains/binance';
 import { BITCOIN_CHAIN, BTC } from '@rosen-chains/bitcoin';
 import { BITCOIN_RUNES_CHAIN } from '@rosen-chains/bitcoin-runes';
@@ -52,7 +53,7 @@ const DefaultRevenueApiCount = 10;
 const ADA_DECIMALS = 6;
 const ERG_DECIMALS = 9;
 
-const SUPPORTED_CHAINS = [
+const LEGACY_SUPPORTED_CHAINS = Object.freeze([
   ERGO_CHAIN,
   CARDANO_CHAIN,
   BITCOIN_CHAIN,
@@ -62,7 +63,19 @@ const SUPPORTED_CHAINS = [
   FIRO_CHAIN,
   HANDSHAKE_CHAIN,
   BITCOIN_RUNES_CHAIN,
-] as const;
+] as const);
+
+/** Known chain identities; registration does not enable a runtime capability. */
+const SUPPORTED_CHAINS = Object.freeze([
+  ...LEGACY_SUPPORTED_CHAINS,
+  AVALANCHE_CHAIN,
+] as const);
+
+/** Existing numeric balance readers exclude Avalanche's exact-string reader. */
+const LEGACY_BALANCE_CHAINS = LEGACY_SUPPORTED_CHAINS;
+/** Implemented capabilities; consumers still require explicit runtime policy. */
+const COLD_STORAGE_CHAINS = SUPPORTED_CHAINS;
+const ARBITRARY_ORDER_CHAINS = SUPPORTED_CHAINS;
 
 enum RevenueType {
   fraud = 'fraud',
@@ -77,6 +90,7 @@ enum TssAlgorithms {
 }
 
 const ChainNativeToken: Record<string, string> = {
+  [AVALANCHE_CHAIN]: AVAX,
   [ERGO_CHAIN]: ERG,
   [CARDANO_CHAIN]: ADA,
   [BITCOIN_CHAIN]: BTC,
@@ -89,6 +103,7 @@ const ChainNativeToken: Record<string, string> = {
 };
 
 const ChainConfigKey: Record<string, string> = {
+  [AVALANCHE_CHAIN]: AVALANCHE_CHAIN,
   [ERGO_CHAIN]: ERGO_CHAIN,
   [CARDANO_CHAIN]: CARDANO_CHAIN,
   [BITCOIN_CHAIN]: BITCOIN_CHAIN,
@@ -130,6 +145,10 @@ export {
   ADA_DECIMALS,
   ERG_DECIMALS,
   SUPPORTED_CHAINS,
+  LEGACY_SUPPORTED_CHAINS,
+  LEGACY_BALANCE_CHAINS,
+  COLD_STORAGE_CHAINS,
+  ARBITRARY_ORDER_CHAINS,
   RevenueType,
   TssAlgorithms,
   ChainNativeToken,

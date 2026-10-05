@@ -1,0 +1,46 @@
+{
+  "name": "@rosen-chains/avalanche",
+  "version": "0.0.0",
+  "description": "Avalanche C-Chain payment adapter for Rosen Bridge",
+  "license": "MIT",
+  "author": "A. Shannon",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rosen-bridge/guard-service.git",
+    "directory": "./packages/chains/avalanche"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsc --build tsconfig.build.json",
+    "test": "vitest",
+    "coverage": "vitest run --coverage",
+    "type-check": "tsc --noEmit",
+    "lint:check": "eslint . && npm run prettify:check",
+    "prettify": "prettier --write . --ignore-path ../../../.gitignore",
+    "prettify:check": "prettier --check . --ignore-path ../../../.gitignore",
+    "lint": "eslint --fix . && npm run prettify",
+    "clean": "rimraf dist && rimraf tsconfig.build.tsbuildinfo",
+    "release": "npm run test -- --run && npm run clean && npm run build && npm publish --access public"
+  },
+  "dependencies": {
+    "@rosen-bridge/abstract-logger": "^4.0.0",
+    "@rosen-bridge/tokens": "^6.0.2",
+    "@rosen-chains/abstract-chain": "^17.0.0",
+    "@rosen-chains/avalanche-rpc": "0.0.0",
+    "@rosen-chains/evm": "^10.1.0",
+    "ethers": "6.16.0"
+  },
+  "devDependencies": {
+    "@rosen-bridge/extended-typeorm": "^1.1.1"
+  },
+  "engines": {
+    "node": ">=22.18.0",
+    "npm": "11.6.2"
+  }
+}

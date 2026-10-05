@@ -27,6 +27,9 @@ ethereum:
 binance:
   rpc:
     authToken: 'BINANCE_RPC_AUTH_TOKEN'
+avalanche:
+  rpc:
+    authToken: 'AVALANCHE_RPC_AUTH_TOKEN'
 handshake:
   rpc:
     username: 'HANDSHAKE_RPC_USERNAME'

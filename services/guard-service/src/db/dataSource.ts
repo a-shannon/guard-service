@@ -7,6 +7,10 @@ import {
   AddressTxsEntity,
   migrations as addressTxExtractorMigrations,
 } from '@rosen-bridge/evm-address-tx-extractor';
+import {
+  AvalancheSafetyState,
+  AvalancheSafetyState1790769600000,
+} from '@rosen-bridge/evm-scanner';
 import { DataSource } from '@rosen-bridge/extended-typeorm';
 import {
   CommitmentEntity,
@@ -47,12 +51,14 @@ const dbConfigs = {
     ChainAddressBalanceEntity,
     AddressEntity,
     RejectedEventEntity,
+    AvalancheSafetyState,
   ],
   migrations: [
     ...scannerMigrations[dbType],
     ...watcherDataExtractorMigrations[dbType],
     ...addressTxExtractorMigrations[dbType],
     ...migrations[dbType],
+    AvalancheSafetyState1790769600000,
   ],
   synchronize: false,
   logging: false,

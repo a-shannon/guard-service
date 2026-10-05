@@ -8,6 +8,7 @@ import {
   TokenInfo,
   TransactionType,
 } from '@rosen-chains/abstract-chain';
+import { AVALANCHE_CHAIN, AvalancheChain } from '@rosen-chains/avalanche';
 import { ERGO_CHAIN, ErgoChain } from '@rosen-chains/ergo';
 
 import TxAgreement from '../agreement/txAgreement';
@@ -19,9 +20,12 @@ import ChainHandler from '../handlers/chainHandler';
 import GuardPkHandler from '../handlers/guardPkHandler';
 import { TokenHandler } from '../handlers/tokenHandler';
 import * as TransactionSerializer from '../transaction/transactionSerializer';
-import { SUPPORTED_CHAINS } from '../utils/constants';
+import { isAvalancheManagementRouteEnabled } from '../utils/avalancheManagementRoutes';
+import { COLD_STORAGE_CHAINS } from '../utils/constants';
 import GuardTurn from '../utils/guardTurn';
 import Utils from '../utils/utils';
+import RequestVerifier from '../verification/requestVerifier';
+import { selectAvalancheColdAssets } from './avalancheColdAssets';
 
 const logger = DefaultLogger.getInstance().child(import.meta.url);
 
@@ -31,7 +35,11 @@ class ColdStorage {
    */
   static processLockAddressAssets = async (): Promise<void> => {
     await Promise.all(
-      SUPPORTED_CHAINS.map((chain) => this.chainColdStorageProcess(chain)),
+      COLD_STORAGE_CHAINS.filter(
+        (chain) =>
+          chain !== AVALANCHE_CHAIN ||
+          isAvalancheManagementRouteEnabled('cold'),
+      ).map((chain) => this.chainColdStorageProcess(chain)),
     );
   };
 
@@ -41,6 +49,12 @@ class ColdStorage {
    * @returns
    */
   static chainColdStorageProcess = async (chainName: string): Promise<void> => {
+    if (!COLD_STORAGE_CHAINS.some((chain) => chain === chainName)) return;
+    if (
+      chainName === AVALANCHE_CHAIN &&
+      !isAvalancheManagementRouteEnabled('cold')
+    )
+      return;
     if (GuardTurn.guardTurn() !== GuardPkHandler.getInstance().guardId) {
       logger.info(
         `Turn is over. Abort cold storage process on chain [${chainName}]`,
@@ -79,6 +93,19 @@ class ColdStorage {
       const transferringTokens: TokenInfo[] = [];
       const forbiddenTokens =
         await DatabaseHandler.getWaitingEventsRequiredTokens();
+      if (chainName === AVALANCHE_CHAIN) {
+        if (!(chain instanceof AvalancheChain))
+          throw new Error('Avalanche cold adapter is unavailable');
+        const selected = await selectAvalancheColdAssets(
+          chain,
+          lockedAssets,
+          thresholdsConfig,
+          forbiddenTokens,
+        );
+        if (selected)
+          await this.generateColdStorageTransaction(selected, chain, chainName);
+        return;
+      }
       Object.keys(thresholds).forEach((tokenId) => {
         if (forbiddenTokens.includes(tokenId)) {
           logger.debug(
@@ -144,18 +171,25 @@ class ColdStorage {
    * @param chain chain object
    * @param chainName
    */
-  static generateColdStorageTransaction = async (
+  static generateColdStorageTransaction = async <TxType>(
     assets: AssetBalance,
-    chain: AbstractChain<unknown>,
+    chain: AbstractChain<TxType>,
     chainName: string,
   ): Promise<void> => {
+    if (
+      !COLD_STORAGE_CHAINS.some((name) => name === chainName) ||
+      (chainName === AVALANCHE_CHAIN &&
+        !isAvalancheManagementRouteEnabled('cold'))
+    )
+      throw new Error(
+        `Cold storage is not supported or enabled for chain [${chainName}]`,
+      );
     // get guardsConfigBox if chain is ergo
     const extra: any[] = []; // eslint-disable-line @typescript-eslint/no-explicit-any
     if (chainName === ERGO_CHAIN) {
-      const guardsConfigBox = await (chain as ErgoChain).getGuardsConfigBox(
-        rosenConfig.guardNFT,
-        rosenConfig.guardSignAddress,
-      );
+      const guardsConfigBox = await (
+        chain as unknown as ErgoChain
+      ).getGuardsConfigBox(rosenConfig.guardNFT, rosenConfig.guardSignAddress);
       extra.push([], [guardsConfigBox]);
     }
 
@@ -203,6 +237,18 @@ class ColdStorage {
     if (GuardTurn.guardTurn() === GuardPkHandler.getInstance().guardId) {
       const txAgreement = await TxAgreement.getInstance();
       for (const tx of txs) {
+        if (
+          chainName === AVALANCHE_CHAIN &&
+          !(await RequestVerifier.verifyColdStorageTransactionRequest(tx))
+        )
+          throw new Error(
+            'Generated Avalanche cold transaction is not admitted',
+          );
+        if (
+          chainName === AVALANCHE_CHAIN &&
+          GuardTurn.guardTurn() !== GuardPkHandler.getInstance().guardId
+        )
+          return;
         txAgreement.addTransactionToQueue(tx);
       }
     } else {

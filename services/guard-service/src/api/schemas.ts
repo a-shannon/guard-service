@@ -9,6 +9,8 @@ import {
   DefaultAssetApiLimit,
   DefaultRevenueApiCount,
   RevenuePeriod,
+  LEGACY_BALANCE_CHAINS,
+  ARBITRARY_ORDER_CHAINS,
   SUPPORTED_CHAINS,
 } from '../utils/constants';
 
@@ -26,7 +28,7 @@ export const TokenDataSchema = z.object({
 
 export const AddressBalanceSchema = z.object({
   address: z.string(),
-  chain: z.string(),
+  chain: z.string().refine((chain) => chain !== 'avalanche'),
   balance: TokenDataSchema,
 });
 
@@ -39,9 +41,43 @@ export const OutputItemsSchema = <T extends z.ZodRawShape>(
   });
 
 export const LockBalanceSchema = z.object({
+  chainId: z
+    .number()
+    .optional()
+    .refine((chainId) => chainId === undefined),
   hot: OutputItemsSchema(AddressBalanceSchema),
   cold: OutputItemsSchema(AddressBalanceSchema),
 });
+
+export const AvalancheAddressBalanceSchema = AddressBalanceSchema.extend({
+  chain: z.literal('avalanche'),
+  balance: TokenDataSchema.extend({
+    amount: z
+      .string()
+      .max(78)
+      .regex(/^(0|[1-9][0-9]*)$/)
+      .refine(
+        (amount) =>
+          /^(0|[1-9][0-9]*)$/.test(amount) && BigInt(amount) < 1n << 256n,
+      ),
+    decimals: z.number().int().min(0).max(255),
+  }),
+});
+
+export const AvalancheLockBalanceSchema = z.object({
+  chainId: z.union([z.literal(43113), z.literal(43114)]),
+  hot: OutputItemsSchema(AvalancheAddressBalanceSchema).extend({
+    total: z.number().int().min(0),
+  }),
+  cold: OutputItemsSchema(AvalancheAddressBalanceSchema).extend({
+    total: z.number().int().min(0),
+  }),
+});
+
+export const BalanceResponseSchema = z.union([
+  AvalancheLockBalanceSchema,
+  LockBalanceSchema,
+]);
 
 export const InfoResponseSchema = z.object({
   versions: z.object({
@@ -131,10 +167,10 @@ export const AddressQuerySchema = z.object({
   type: z.optional(z.nativeEnum(AddressType)),
 });
 
-export const BalanceQuerySchema = z.object({
+const LegacyBalanceQuerySchema = z.object({
   offset: z.coerce.number().int().min(0).default(0),
   limit: z.coerce.number().int().min(1).max(100).default(DefaultAssetApiLimit),
-  chain: z.optional(SupportedChainsSchema),
+  chain: z.optional(z.enum(LEGACY_BALANCE_CHAINS)),
   tokenId: z.optional(
     z
       .string()
@@ -143,6 +179,20 @@ export const BalanceQuerySchema = z.object({
   ),
 });
 
+export const BalanceQuerySchema = z.union([
+  LegacyBalanceQuerySchema.extend({
+    chain: z.literal('avalanche'),
+    // TokenMap and the cache preserve ERC-20 address case.
+    tokenId: z.optional(
+      z
+        .string()
+        .max(100)
+        .regex(/^(?:[0-9a-z.:]*|0x[0-9a-fA-F]{40})$/),
+    ),
+  }),
+  LegacyBalanceQuerySchema,
+]);
+
 export const AssetsResponseSchema = OutputItemsSchema(
   z.object({
     tokenId: z.string(),
@@ -150,7 +200,7 @@ export const AssetsResponseSchema = OutputItemsSchema(
     coldAmount: z.number(),
     name: z.optional(z.string()),
     decimals: z.number(),
-    chain: SupportedChainsSchema,
+    chain: z.enum(LEGACY_BALANCE_CHAINS),
     isNativeToken: z.boolean(),
   }),
 );
@@ -236,7 +286,7 @@ export const TssCallbackSchema = z.object({
 
 export const OrderQuerySchema = z.object({
   id: z.string(),
-  chain: z.enum(SUPPORTED_CHAINS),
+  chain: z.enum(ARBITRARY_ORDER_CHAINS),
   orderJson: z.string(),
 });
 

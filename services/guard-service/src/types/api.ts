@@ -39,6 +39,18 @@ interface LockBalance {
   cold: Page<AddressBalance>;
 }
 
+interface AvalancheAddressBalance {
+  address: string;
+  chain: 'avalanche';
+  balance: Omit<TokenData, 'amount'> & { amount: string };
+}
+
+interface AvalancheLockBalance {
+  chainId: 43113 | 43114;
+  hot: Page<AvalancheAddressBalance>;
+  cold: Page<AvalancheAddressBalance>;
+}
+
 interface SingleRevenue {
   revenueType: RevenueType;
   data: TokenData;
@@ -114,6 +126,8 @@ export {
   ChainTokenData,
   AddressBalance,
   LockBalance,
+  AvalancheAddressBalance,
+  AvalancheLockBalance,
   SingleRevenue,
   RevenueHistory,
   Event,

@@ -13,6 +13,18 @@ api:
   maxRequestsPerMinutePostRoutes: 10
 publicStatus:
   baseUrl: ''
+avalanche:
+  enabled: false # Requires explicit network, contracts and operator configuration.
+  routes: # Opt-ins require the corresponding runtime authorization policy.
+    cold: false
+    manual: false
+    arbitrary: false
+  confirmation: # Operator block counts are required before enabling Avalanche.
+    observation: null
+    payment: null
+    cold: null
+    manual: null
+    arbitrary: null
 binance:
   chainNetwork: 'rpc' # 'rpc'
   rpc:

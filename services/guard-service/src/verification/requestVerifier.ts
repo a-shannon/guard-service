@@ -3,11 +3,14 @@ import {
   PaymentTransaction,
   TransactionType,
 } from '@rosen-chains/abstract-chain';
+import { AVALANCHE_CHAIN } from '@rosen-chains/avalanche';
 import { ERGO_CHAIN } from '@rosen-chains/ergo';
 
+import Configs from '../configs/configs';
 import { DatabaseAction } from '../db/databaseAction';
 import EventSerializer from '../event/eventSerializer';
 import EventSynchronization from '../synchronization/eventSynchronization';
+import { isAvalancheManagementRouteEnabled } from '../utils/avalancheManagementRoutes';
 import { EventStatus, OrderStatus } from '../utils/constants';
 import EventVerifier from './eventVerifier';
 import TransactionVerifier from './transactionVerifier';
@@ -148,6 +151,25 @@ class RequestVerifier {
   static verifyArbitraryTransactionRequest = async (
     tx: PaymentTransaction,
   ): Promise<boolean> => {
+    const avalanche = tx.network === AVALANCHE_CHAIN;
+    if (
+      avalanche &&
+      (!isAvalancheManagementRouteEnabled('arbitrary') ||
+        !Configs.isArbitraryOrderRequestActive ||
+        tx.txType !== TransactionType.arbitrary ||
+        typeof tx.eventId !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(tx.eventId))
+    )
+      return false;
+    const captured = avalanche
+      ? {
+          network: tx.network,
+          txType: tx.txType,
+          eventId: tx.eventId,
+          txId: tx.txId,
+          txBytes: Buffer.from(tx.txBytes).toString('hex'),
+        }
+      : undefined;
     const orderId = tx.eventId;
     const baseError = `Received tx [${tx.txId}] for arbitrary order [${orderId}] `;
 
@@ -171,6 +193,15 @@ class RequestVerifier {
     // check if order has any active tx for requested tx type
     const orderTxs =
       await DatabaseAction.getInstance().getOrderValidTxs(orderId);
+    if (
+      avalanche &&
+      (!([OrderStatus.pending, OrderStatus.inProcess] as string[]).includes(
+        orderEntity.status,
+      ) ||
+        orderTxs.some((active) => active.txId !== tx.txId) ||
+        (orderTxs.length === 0 && orderEntity.status !== OrderStatus.pending))
+    )
+      return false;
     if (orderTxs.length !== 0 && orderTxs[0].txId !== tx.txId) {
       logger.warn(baseError + `but order has active tx [${orderTxs[0].txId}]`);
       return false;
@@ -195,6 +226,18 @@ class RequestVerifier {
       logger.warn(baseError + `but tx hasn't verified`);
       return false;
     }
+
+    if (
+      captured &&
+      (tx.network !== captured.network ||
+        tx.txType !== captured.txType ||
+        tx.eventId !== captured.eventId ||
+        tx.txId !== captured.txId ||
+        Buffer.from(tx.txBytes).toString('hex') !== captured.txBytes ||
+        !isAvalancheManagementRouteEnabled('arbitrary') ||
+        !Configs.isArbitraryOrderRequestActive)
+    )
+      return false;
 
     return true;
   };

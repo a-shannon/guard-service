@@ -16,7 +16,21 @@ export interface ChainConfigs {
   };
   cleanupConfirm: number;
 }
+export interface AvalancheContracts {
+  readonly addresses: { readonly lock: string };
+}
+export interface AvalancheBridgeContracts extends AvalancheContracts {
+  readonly addresses: AvalancheContracts['addresses'] & {
+    readonly cold: string;
+    readonly WatcherPermit: string;
+    readonly Fraud: string;
+    readonly WatcherTriggerEvent: string;
+    readonly Commitment: string;
+  };
+  readonly tokens: { readonly RWTId: string };
+}
 export type AllChainsConfigs = {
+  avalanche?: AvalancheContracts;
   version: string;
   tokens: {
     RWTRepoNFT: string;

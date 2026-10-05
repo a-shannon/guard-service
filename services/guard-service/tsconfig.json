@@ -8,7 +8,11 @@
     "useUnknownInCatchVariables": false,
     "types": ["node", "vitest/globals"]
   },
-  "include": ["./**/*.ts", "package.json"],
+  "include": [
+    "./**/*.ts",
+    "package.json",
+    "tests/utils/contractTokensTestData.json"
+  ],
   "exclude": ["./vitest.config.ts"],
   "references": [
     { "path": "../../packages/abstract-chain" },
@@ -22,6 +26,7 @@
     { "path": "../../packages/chains/handshake" },
     { "path": "../../packages/chains/ethereum" },
     { "path": "../../packages/chains/evm" },
+    { "path": "../../packages/chains/avalanche" },
     { "path": "../../packages/networks/bitcoin-esplora" },
     { "path": "../../packages/networks/bitcoin-runes-rpc" },
     { "path": "../../packages/networks/cardano-blockfrost" },
@@ -33,6 +38,7 @@
     { "path": "../../packages/networks/doge-rpc" },
     { "path": "../../packages/networks/ergo-explorer" },
     { "path": "../../packages/networks/ergo-node" },
-    { "path": "../../packages/networks/evm-rpc" }
+    { "path": "../../packages/networks/evm-rpc" },
+    { "path": "../../packages/networks/avalanche-rpc" }
   ]
 }

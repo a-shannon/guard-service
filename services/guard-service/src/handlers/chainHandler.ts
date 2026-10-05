@@ -61,7 +61,9 @@ import GuardsEthereumConfigs from '../configs/guardsEthereumConfigs';
 import GuardsFiroConfigs from '../configs/guardsFiroConfigs';
 import GuardsHandshakeConfigs from '../configs/guardsHandshakeConfigs';
 import { dataSource } from '../db/dataSource';
+import type { PreparedAvalancheInputs } from '../jobs/avalancheScannerStartup';
 import * as TransactionSerializer from '../transaction/transactionSerializer';
+import { createAvalancheChain } from '../utils/avalancheChain';
 import MultiSigHandler from './multiSigHandler';
 import { TokenHandler } from './tokenHandler';
 import TssHandler from './tssHandler';
@@ -70,6 +72,9 @@ const logger = DefaultLogger.getInstance().child(import.meta.url);
 
 class ChainHandler {
   private static instance: ChainHandler;
+  private static startupPhase?: 'prepared' | 'initializing' | 'initialized';
+  private static avalancheInputs?: PreparedAvalancheInputs;
+  private avalanche?: Awaited<ReturnType<typeof createAvalancheChain>>;
   private readonly ergoChain: ErgoChain;
   private readonly cardanoChain: CardanoChain;
   private readonly bitcoinChain: BitcoinChain;
@@ -103,12 +108,52 @@ class ChainHandler {
    * @returns ChainHandler instance
    */
   public static getInstance = () => {
+    if (
+      ChainHandler.startupPhase &&
+      ChainHandler.startupPhase !== 'initialized'
+    )
+      throw new Error('Chains are not initialized');
     if (!ChainHandler.instance) {
       logger.debug("ChainHandler instance didn't exist. Creating a new one");
       ChainHandler.instance = new ChainHandler();
     }
     return ChainHandler.instance;
   };
+
+  /** Retains prepared Avalanche inputs and closes later startup takeover. */
+  static prepareStartup = (inputs?: PreparedAvalancheInputs): void => {
+    if (ChainHandler.startupPhase || ChainHandler.instance)
+      throw new Error('Chain startup already attempted');
+    ChainHandler.avalancheInputs = inputs;
+    ChainHandler.startupPhase = 'prepared';
+  };
+
+  /** Publishes complete chains only after Avalanche construction and drift checks succeed. */
+  static initialize = async (): Promise<void> => {
+    if (ChainHandler.startupPhase !== 'prepared')
+      throw new Error('Chain startup is not prepared or already attempted');
+    ChainHandler.startupPhase = 'initializing';
+    const inputs = ChainHandler.avalancheInputs;
+    const avalanche = inputs
+      ? await ChainHandler.generateAvalancheChain(inputs)
+      : undefined;
+    avalanche?.assertTokenMapUnchanged();
+    const instance = new ChainHandler();
+    instance.avalanche = avalanche;
+    ChainHandler.instance = instance;
+    ChainHandler.startupPhase = 'initialized';
+  };
+
+  /** Initializes Avalanche from prepared inputs before constructing legacy chains. */
+  private static generateAvalancheChain = async (
+    inputs: PreparedAvalancheInputs,
+  ): Promise<Awaited<ReturnType<typeof createAvalancheChain>>> =>
+    createAvalancheChain(inputs.config, inputs.contracts, {
+      dataSource,
+      tokens: TokenHandler.getInstance().getTokenMap(),
+      createSignMediator: TssHandler.getInstance().wrapCurveSignMediator,
+      logger: DefaultLogger.getInstance().child('avalancheChain'),
+    });
 
   /**
    * generates Ergo network and chain objects using configs
@@ -495,7 +540,11 @@ class ChainHandler {
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   getChain = (chain: string): AbstractChain<any> => {
+    this.avalanche?.assertTokenMapUnchanged();
     switch (chain) {
+      case 'avalanche':
+        if (!this.avalanche) throw new Error('Avalanche chain is not enabled');
+        return this.avalanche.chain;
       case ERGO_CHAIN:
         return this.ergoChain;
       case CARDANO_CHAIN:
@@ -519,11 +568,23 @@ class ChainHandler {
     }
   };
 
+  /** Raw settled AVAX wei for the captured bridge lock address. */
+  getAvalancheLockBalance = async (): Promise<bigint> => {
+    const inputs = ChainHandler.avalancheInputs;
+    if (!this.avalanche || !inputs)
+      throw new Error('Avalanche chain is not enabled');
+    this.avalanche.assertTokenMapUnchanged();
+    return this.avalanche.network.getAddressBalanceForNativeToken(
+      inputs.contracts.addresses.lock,
+    );
+  };
+
   /**
    * gets ergo chain object
    * @returns chain object
    */
   getErgoChain = (): ErgoChain => {
+    this.avalanche?.assertTokenMapUnchanged();
     return this.ergoChain;
   };
 }

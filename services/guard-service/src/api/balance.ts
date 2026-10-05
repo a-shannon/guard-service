@@ -2,10 +2,11 @@ import { DefaultLogger } from '@rosen-bridge/abstract-logger';
 import { FastifyWithZod } from '@rosen-bridge/fastify-enhanced';
 
 import BalanceHandler from '../handlers/balanceHandler';
-import { LockBalance } from '../types/api';
+import { AvalancheLockBalance, LockBalance } from '../types/api';
 import {
+  AvalancheLockBalanceSchema,
   BalanceQuerySchema,
-  LockBalanceSchema,
+  BalanceResponseSchema,
   MessageResponseSchema,
 } from './schemas';
 
@@ -22,7 +23,7 @@ const getBalanceRoute = (server: FastifyWithZod) => {
       schema: {
         querystring: BalanceQuerySchema,
         response: {
-          200: LockBalanceSchema,
+          200: BalanceResponseSchema,
           500: MessageResponseSchema,
         },
       },
@@ -31,6 +32,17 @@ const getBalanceRoute = (server: FastifyWithZod) => {
       const { offset, limit, chain, tokenId } = request.query;
 
       try {
+        if (chain === 'avalanche') {
+          const balance: AvalancheLockBalance =
+            await BalanceHandler.getInstance().getAvalancheBalances(
+              tokenId,
+              offset,
+              limit,
+            );
+          return reply
+            .status(200)
+            .send(AvalancheLockBalanceSchema.parse(balance));
+        }
         const balance: LockBalance = {
           hot: { items: [], total: 0 },
           cold: { items: [], total: 0 },

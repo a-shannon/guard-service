@@ -22,7 +22,9 @@ import {
 } from '../utils/constants';
 import GuardTurn from '../utils/guardTurn';
 import RequestVerifier from '../verification/requestVerifier';
+import RewardAuthorization from '../verification/rewardAuthorization';
 import TransactionVerifier from '../verification/transactionVerifier';
+import { AvalancheRewardAdmission } from './avalancheRewardAdmission';
 import {
   CandidateTransaction,
   TransactionRequest,
@@ -47,6 +49,92 @@ class TxAgreement extends Communicator {
   protected transactionApprovals: Map<string, string[]>; // txDataHash -> signatures
   protected approvedTransactions: ApprovedCandidate[];
   protected approvalSemaphore: Semaphore;
+  private readonly rewardAdmissions = new Map<
+    string,
+    AvalancheRewardAdmission
+  >();
+  private readonly rewardObjects = new WeakMap<
+    PaymentTransaction,
+    AvalancheRewardAdmission
+  >();
+  private readonly rewardGuardAuthority: string;
+  private rewardEpoch = 0;
+
+  /** Captures guard identities and threshold for later equality checks. */
+  private guardFingerprint = (): string => {
+    const guards = GuardPkHandler.getInstance();
+    return JSON.stringify([
+      guards.publicKeys,
+      guards.requiredSign,
+      guards.guardId,
+      guards.guardsLen,
+      this.guardPks,
+    ]);
+  };
+
+  /** Rejects reward admission after the configured guard authority changes. */
+  private assertRewardGuards = (): void => {
+    const guards = GuardPkHandler.getInstance();
+    if (
+      this.guardFingerprint() !== this.rewardGuardAuthority ||
+      !Number.isSafeInteger(guards.requiredSign) ||
+      guards.requiredSign < 1 ||
+      guards.requiredSign > this.guardPks.length ||
+      !Number.isSafeInteger(guards.guardId) ||
+      guards.guardId < 0 ||
+      guards.guardId >= this.guardPks.length ||
+      this.index !== guards.guardId ||
+      JSON.stringify(guards.publicKeys) !== JSON.stringify(this.guardPks) ||
+      new Set(this.guardPks).size !== this.guardPks.length
+    )
+      throw new Error('Reward guard authority changed; restart required');
+  };
+
+  /** Returns the captured reward admission when the transaction requires it. */
+  private getRewardAdmission = async (
+    tx: PaymentTransaction,
+  ): Promise<AvalancheRewardAdmission | undefined> => {
+    RewardAuthorization.capturedAuthority(tx);
+    const epoch = this.rewardEpoch;
+    const owned = this.rewardObjects.get(tx);
+    if (owned) {
+      owned.assertCandidate(tx);
+      return owned;
+    }
+    if (tx.txType !== TransactionType.reward) return undefined;
+    const snapshot = AvalancheRewardAdmission.fingerprint(tx);
+    const hash = TransactionSerializer.getTxDataHash(tx);
+    const cached = this.rewardAdmissions.get(hash);
+    if (cached) {
+      cached.assertCandidate(tx);
+      this.rewardObjects.set(tx, cached);
+      return cached;
+    }
+    await this.getIndex();
+    if (AvalancheRewardAdmission.fingerprint(tx) !== snapshot)
+      throw new Error('Reward input changed while resolving signer');
+    const admission = await AvalancheRewardAdmission.bind(
+      tx,
+      GuardPkHandler.getInstance().requiredSign,
+      () => {
+        this.assertRewardGuards();
+        if (this.rewardEpoch !== epoch)
+          throw new Error('Reward agreement attempt was cleared');
+      },
+    );
+    if (admission) {
+      admission.assertCandidate(tx);
+      const existing = this.rewardAdmissions.get(hash);
+      if (existing && existing !== admission) {
+        existing.assertCandidate(tx);
+        return existing;
+      }
+      this.rewardAdmissions.set(hash, admission);
+      this.rewardObjects.set(tx, admission);
+      this.rewardObjects.set(admission.payment, admission);
+    }
+    return admission;
+  };
 
   protected constructor() {
     super(
@@ -64,6 +152,7 @@ class TxAgreement extends Communicator {
     this.transactionApprovals = new Map();
     this.approvedTransactions = [];
     this.approvalSemaphore = new Semaphore(1);
+    this.rewardGuardAuthority = this.guardFingerprint();
   }
 
   /**
@@ -142,10 +231,30 @@ class TxAgreement extends Communicator {
    */
   processAgreementQueue = async (): Promise<void> => {
     let tx: PaymentTransaction;
-    while (this.transactionQueue.length > 0) {
+    let remaining = this.transactionQueue.length;
+    while (remaining-- > 0 && this.transactionQueue.length > 0) {
+      const epoch = this.rewardEpoch;
       tx = this.transactionQueue.pop()!;
+      let retryReward = RewardAuthorization.hasCapturedAuthority(tx);
       try {
         const timestamp = Math.round(Date.now() / 1000);
+        const reward = await this.getRewardAdmission(tx);
+        if (reward) {
+          retryReward = true;
+          const hash = reward.hash;
+          await this.broadcastTransactionRequest(tx, timestamp);
+          const signature = await this.signCandidateMessage(hash, timestamp);
+          await reward.withAction(() => {
+            reward.assertCandidate(tx);
+            if (this.transactions.has(hash))
+              throw new Error('Reward candidate already active');
+            const approvals = Array(this.guardPks.length).fill('');
+            approvals[this.index] = signature;
+            this.transactions.set(hash, { tx: reward.payment, timestamp });
+            this.transactionApprovals.set(hash, approvals);
+          });
+          continue;
+        }
         const txDataHash = TransactionSerializer.getTxDataHash(tx);
 
         // broadcast the transaction
@@ -161,6 +270,13 @@ class TxAgreement extends Communicator {
         this.transactionApprovals.set(txDataHash, approvals);
         logger.info(`Started agreement process for tx [${tx.txId}]`);
       } catch (e) {
+        if (
+          (retryReward ||
+            (tx.txType === TransactionType.reward &&
+              RewardAuthorization.remembersEvent(tx.eventId))) &&
+          this.rewardEpoch === epoch
+        )
+          this.transactionQueue.unshift(tx);
         logger.warn(
           `An error occurred while starting agreement process for tx [${tx.txId}]: ${e}`,
         );
@@ -178,9 +294,43 @@ class TxAgreement extends Communicator {
     tx: PaymentTransaction,
     timestamp: number,
   ): Promise<void> => {
+    const candidate = this.transactions.get(
+      TransactionSerializer.getTxDataHash(tx),
+    );
+    const reward = await this.getRewardAdmission(tx);
+    if (reward && (!Number.isSafeInteger(timestamp) || timestamp < 0))
+      throw new Error('Invalid reward timestamp');
+    /** Checks that the current candidate still matches the captured reward admission. */
+    const assertCandidate = () => {
+      if (!reward) return;
+      reward.assertCandidate(tx);
+      if (GuardTurn.guardTurn() !== this.index)
+        throw new Error('Reward request is no longer our turn');
+      if (
+        this.transactions.get(reward.hash) !== candidate ||
+        (candidate &&
+          (candidate.timestamp !== timestamp || candidate.tx !== tx))
+      )
+        throw new Error('Reward request candidate changed');
+    };
     const candidatePayload: TransactionRequest = {
       txJson: tx.toJson(),
     };
+
+    if (reward) {
+      await this.sendMessage(
+        AgreementMessageTypes.request,
+        candidatePayload,
+        [],
+        timestamp,
+        (submit) =>
+          reward.withAction(() => {
+            assertCandidate();
+            submit();
+          }),
+      );
+      return;
+    }
 
     // broadcast the transaction
     await this.sendMessage(
@@ -277,6 +427,43 @@ class TxAgreement extends Communicator {
     timestamp: number,
     receiver: string,
   ): Promise<void> => {
+    const reward = await this.getRewardAdmission(tx);
+    if (reward) {
+      if (GuardTurn.guardTurn() !== creatorId) return;
+      if (!Number.isSafeInteger(timestamp) || timestamp < 0)
+        throw new Error('Invalid reward timestamp');
+      const hash = reward.hash;
+      const previous = this.transactions.get(hash);
+      const agreed = this.eventAgreedTransactions.get(tx.eventId);
+      /** Checks that the in-memory agreement still matches the captured candidate. */
+      const assertMemory = () => {
+        reward.assertCandidate(tx);
+        if (
+          GuardTurn.guardTurn() !== creatorId ||
+          this.transactions.get(hash) !== previous ||
+          this.eventAgreedTransactions.get(tx.eventId) !== agreed ||
+          (agreed !== undefined && agreed !== hash)
+        )
+          throw new Error('Reward response candidate changed');
+      };
+      await this.sendMessage(
+        AgreementMessageTypes.response,
+        { txDataHash: hash },
+        [receiver],
+        timestamp,
+        (submit) =>
+          reward.withAction(() => {
+            assertMemory();
+            submit();
+          }),
+      );
+      await reward.withAction(() => {
+        assertMemory();
+        this.transactions.set(hash, { tx: reward.payment, timestamp });
+        this.eventAgreedTransactions.set(tx.eventId, hash);
+      });
+      return;
+    }
     // verify transaction
     if (!(await this.verifyTransactionRequest(tx, creatorId))) return;
 
@@ -411,6 +598,59 @@ class TxAgreement extends Communicator {
   ): Promise<void> => {
     const candidateTx = this.transactions.get(txDataHash);
     if (candidateTx === undefined) return;
+    const reward = await this.getRewardAdmission(candidateTx.tx);
+    if (reward) {
+      const release = await this.approvalSemaphore.acquire();
+      try {
+        const previous = this.transactionApprovals.get(txDataHash);
+        if (
+          !previous ||
+          !Number.isSafeInteger(signerIndex) ||
+          signerIndex < 0 ||
+          signerIndex >= this.guardPks.length ||
+          !signature
+        )
+          throw new Error('Invalid reward approval index');
+        const before = JSON.stringify(previous);
+        /** Checks that the in-memory agreement still matches the captured candidate. */
+        const assertMemory = () => {
+          reward.assertCandidate(candidateTx.tx);
+          if (
+            reward.hash !== txDataHash ||
+            this.transactions.get(txDataHash) !== candidateTx ||
+            candidateTx.timestamp !== timestamp ||
+            this.transactionApprovals.get(txDataHash) !== previous ||
+            JSON.stringify(previous) !== before
+          )
+            throw new Error('Reward quorum candidate changed');
+        };
+        assertMemory();
+        const approvals = [...previous];
+        approvals[signerIndex] = signature;
+        if (approvals.filter(Boolean).length < reward.requiredSign) {
+          await reward.withAction(() => {
+            assertMemory();
+            this.transactionApprovals.set(txDataHash, approvals);
+          });
+          return;
+        }
+        const approved = {
+          tx: candidateTx.tx,
+          signatures: approvals,
+          timestamp,
+        };
+        await this.broadcastApprovalMessage(approved, assertMemory);
+        await reward.persist(assertMemory);
+        assertMemory();
+        this.transactions.delete(txDataHash);
+        this.transactionApprovals.delete(txDataHash);
+        this.eventAgreedTransactions.delete(candidateTx.tx.eventId);
+        this.approvedTransactions.push(approved);
+      } finally {
+        release();
+      }
+      return;
+    }
     if (candidateTx.timestamp !== timestamp) {
       logger.debug(
         `Received guard [${signerIndex}] agreement for tx [${candidateTx.tx.txId}] but timestamp is wrong [${candidateTx.timestamp} !== ${timestamp}]`,
@@ -470,11 +710,41 @@ class TxAgreement extends Communicator {
    */
   protected broadcastApprovalMessage = async (
     approvedCandidate: ApprovedCandidate,
+    assertMemory?: () => void,
   ): Promise<void> => {
+    const index = this.approvedTransactions.indexOf(approvedCandidate);
+    const signatures = JSON.stringify(approvedCandidate.signatures);
+    const timestamp = approvedCandidate.timestamp;
+    const reward = await this.getRewardAdmission(approvedCandidate.tx);
     const approvalPayload: TransactionApproved = {
       txJson: approvedCandidate.tx.toJson(),
       signatures: approvedCandidate.signatures,
     };
+
+    if (reward) {
+      if (!Number.isSafeInteger(timestamp) || timestamp < 0)
+        throw new Error('Invalid reward timestamp');
+      await this.sendMessage(
+        AgreementMessageTypes.approval,
+        approvalPayload,
+        [],
+        timestamp,
+        (submit) =>
+          reward.withAction(() => {
+            assertMemory?.();
+            reward.assertCandidate(approvedCandidate.tx);
+            if (
+              (index >= 0 &&
+                this.approvedTransactions[index] !== approvedCandidate) ||
+              approvedCandidate.timestamp !== timestamp ||
+              JSON.stringify(approvedCandidate.signatures) !== signatures
+            )
+              throw new Error('Reward approval envelope changed');
+            submit();
+          }, true),
+      );
+      return;
+    }
 
     // broadcast the transaction
     await this.sendMessage(
@@ -500,6 +770,70 @@ class TxAgreement extends Communicator {
     timestamp: number,
     sender: string,
   ): Promise<void> => {
+    const initialHash = TransactionSerializer.getTxDataHash(tx);
+    const previousCandidate = this.transactions.get(initialHash);
+    const previouslyAgreed = this.eventAgreedTransactions.get(tx.eventId);
+    const reward = await this.getRewardAdmission(tx);
+    if (reward) {
+      const votes = [...signatures];
+      if (
+        votes.length !== this.guardPks.length ||
+        !Number.isSafeInteger(timestamp) ||
+        timestamp < 0 ||
+        !Number.isSafeInteger(senderIndex) ||
+        senderIndex < 0 ||
+        senderIndex >= votes.length
+      )
+        throw new Error('Invalid reward approval envelope');
+      const hash = reward.hash;
+      const previous = previousCandidate;
+      const agreed = previouslyAgreed;
+      /** Checks that the in-memory agreement still matches the captured candidate. */
+      const assertMemory = () => {
+        reward.assertCandidate(tx);
+        if (
+          JSON.stringify(signatures) !== JSON.stringify(votes) ||
+          this.transactions.get(hash) !== previous ||
+          (previous &&
+            (previous.timestamp !== timestamp ||
+              TransactionSerializer.getTxDataHash(previous.tx) !== hash)) ||
+          this.eventAgreedTransactions.get(tx.eventId) !== agreed ||
+          (agreed !== undefined && agreed !== hash)
+        )
+          throw new Error('Reward approval candidate changed');
+      };
+      let count = 0;
+      for (let index = 0; index < votes.length; index++) {
+        if (!votes[index]) continue;
+        if (
+          !(await this.messageEnc.verify(
+            Communicator.generatePayloadToSign(
+              { txDataHash: hash },
+              timestamp,
+              this.guardPks[index],
+              this.protocolVersion,
+            ),
+            votes[index],
+            this.guardPks[index],
+          ))
+        )
+          throw new Error('Invalid reward approval signature');
+        count++;
+      }
+      if (count < reward.requiredSign)
+        throw new Error('Reward quorum is insufficient');
+      const release = await this.approvalSemaphore.acquire();
+      try {
+        await reward.persist(assertMemory);
+        assertMemory();
+        this.transactions.delete(hash);
+        this.transactionApprovals.delete(hash);
+        this.eventAgreedTransactions.delete(tx.eventId);
+      } finally {
+        release();
+      }
+      return;
+    }
     const txDataHash = TransactionSerializer.getTxDataHash(tx);
     let baseError = `Received approval message for tx [${tx.txId}] (with data hash [${txDataHash}]) from sender [${sender}] `;
     let signs = 0;
@@ -572,6 +906,20 @@ class TxAgreement extends Communicator {
    * @param tx
    */
   protected setTxAsApproved = async (tx: PaymentTransaction): Promise<void> => {
+    const reward = await this.getRewardAdmission(tx);
+    if (reward) {
+      const hash = reward.hash;
+      const candidate = this.transactions.get(hash);
+      await reward.persist(() => {
+        reward.assertCandidate(tx);
+        if (this.transactions.get(hash) !== candidate)
+          throw new Error('Reward candidate changed before persistence');
+      });
+      this.transactions.delete(hash);
+      this.transactionApprovals.delete(hash);
+      this.eventAgreedTransactions.delete(tx.eventId);
+      return;
+    }
     const txRecord = await DatabaseAction.getInstance().getTxById(tx.txId);
     try {
       if (txRecord === null) {
@@ -708,6 +1056,8 @@ class TxAgreement extends Communicator {
    * clears all pending for agreement and approved txs in memory
    */
   clearTransactions = (): void => {
+    this.rewardEpoch++;
+    this.rewardAdmissions.clear();
     logger.info(
       `Removing [${this.transactionQueue.length}] generated transactions from agreement queue and [${this.transactionApprovals.size}] from memory`,
     );
@@ -721,6 +1071,8 @@ class TxAgreement extends Communicator {
    * clears all pending for approval txs in memory and db
    */
   clearAgreedTransactions = async (): Promise<void> => {
+    this.rewardEpoch++;
+    this.rewardAdmissions.clear();
     logger.info(
       `Removing [${this.eventAgreedTransactions.size}e, ${this.agreedColdStorageTransactions.size}c, ${this.orderAgreedTransactions.size}o] agreed transactions from memory`,
     );

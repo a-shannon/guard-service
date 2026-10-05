@@ -1,13 +1,49 @@
 import config from 'config';
 
+import { chainValidators } from '@rosen-bridge/address-codec';
 import { ERGO_CHAIN, ErgoConfigs } from '@rosen-chains/ergo';
 import { EXPLORER_NETWORK } from '@rosen-chains/ergo-explorer-network';
 import { NODE_NETWORK } from '@rosen-chains/ergo-node-network';
 
 import { FeeDistribution } from '../types/config';
-import { SUPPORTED_CHAINS } from '../utils/constants';
+import { LEGACY_SUPPORTED_CHAINS } from '../utils/constants';
 import { getChainNetworkName, getConfigIntKeyOrDefault } from './configs';
+import { AvalancheConfigReader } from './guardsAvalancheConfigs';
 import { rosenConfig } from './rosenConfig';
+
+/** Validates and captures the enabled Avalanche reward fee distribution. */
+export const readAvalancheFeeDistribution = (
+  reader: AvalancheConfigReader,
+): FeeDistribution | undefined => {
+  if (!reader.has('avalanche.enabled')) return undefined;
+  const enabled = reader.get<unknown>('avalanche.enabled');
+  if (typeof enabled !== 'boolean')
+    throw new Error('Invalid avalanche.enabled');
+  if (!enabled) return undefined;
+  const path = 'reward.bridgeFee.avalanche';
+  if (!reader.has(path)) throw new Error(`Missing ${path}`);
+  const raw = reader.get<unknown>(path);
+  if (!Array.isArray(raw)) throw new Error(`Invalid ${path}`);
+  let total = 0;
+  const distribution = raw.map((entry: unknown) => {
+    const value = entry as { address?: unknown; percent?: unknown } | null;
+    if (
+      !value ||
+      typeof value.address !== 'string' ||
+      !value.address ||
+      value.address.trim() !== value.address ||
+      typeof value.percent !== 'number' ||
+      !Number.isSafeInteger(value.percent) ||
+      value.percent < 0
+    )
+      throw new Error(`Invalid ${path} entry`);
+    chainValidators.ergo(value.address);
+    total += value.percent;
+    return Object.freeze({ address: value.address, percent: value.percent });
+  });
+  if (total >= 100) throw new Error(`Invalid ${path} total`);
+  return Object.freeze(distribution) as unknown as FeeDistribution;
+};
 
 class GuardsErgoConfigs {
   // service configs
@@ -56,8 +92,8 @@ class GuardsErgoConfigs {
   );
   static bridgeFeeDefaultDistribution: FeeDistribution =
     config.get<FeeDistribution>('reward.bridgeFee.defaultDistribution');
-  static chainBridgeFeeDistribution: Record<string, FeeDistribution> =
-    SUPPORTED_CHAINS.map((chain) => {
+  static chainBridgeFeeDistribution: Record<string, FeeDistribution> = {
+    ...LEGACY_SUPPORTED_CHAINS.map((chain) => {
       // check if there is a specific distribution for the chain
       const distribution = config.has(`reward.bridgeFee.${chain}`)
         ? config.get<FeeDistribution>(`reward.bridgeFee.${chain}`)
@@ -72,7 +108,12 @@ class GuardsErgoConfigs {
           `Invalid bridge fee distribution for chain [${chain}]: expected sum to be less than 100, found [${sumDistributionPercent}]`,
         );
       return { [chain]: distribution };
-    }).reduce((a, b) => ({ ...a, ...b }), {}); // merge all distributions into one object
+    }).reduce((a, b) => ({ ...a, ...b }), {}),
+    ...((): Record<string, FeeDistribution> => {
+      const distribution = readAvalancheFeeDistribution(config);
+      return distribution === undefined ? {} : { avalanche: distribution };
+    })(),
+  };
   static bridgeFeeAddresses = new Set<string>(
     Object.values(this.chainBridgeFeeDistribution)
       .flatMap((distribution) => distribution.map((address) => address.address))

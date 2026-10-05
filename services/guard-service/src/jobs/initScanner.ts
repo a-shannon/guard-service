@@ -1,3 +1,5 @@
+import config from 'config';
+
 import { InitializeOptions } from '@rosen-bridge/abstract-extractor';
 import { DefaultLogger } from '@rosen-bridge/abstract-logger';
 import {
@@ -6,7 +8,11 @@ import {
   ErgoScanner,
 } from '@rosen-bridge/ergo-scanner';
 import { EvmTxExtractor } from '@rosen-bridge/evm-address-tx-extractor';
-import { EvmRpcNetwork, EvmRpcScanner } from '@rosen-bridge/evm-scanner';
+import {
+  AvalancheRpcScanner,
+  EvmRpcNetwork,
+  EvmRpcScanner,
+} from '@rosen-bridge/evm-scanner';
 import { ErgoNetworkType } from '@rosen-bridge/scanner-interfaces';
 import {
   CommitmentExtractor,
@@ -17,6 +23,7 @@ import { NODE_NETWORK } from '@rosen-chains/ergo-node-network';
 import { ETHEREUM_CHAIN } from '@rosen-chains/ethereum';
 
 import Configs from '../configs/configs';
+import { readAvalancheConfig } from '../configs/guardsAvalancheConfigs';
 import GuardsBinanceConfigs from '../configs/guardsBinanceConfigs';
 import GuardsBitcoinConfigs from '../configs/guardsBitcoinConfigs';
 import GuardsBitcoinRunesConfigs from '../configs/guardsBitcoinRunesConfigs';
@@ -26,18 +33,37 @@ import GuardsErgoConfigs from '../configs/guardsErgoConfigs';
 import GuardsEthereumConfigs from '../configs/guardsEthereumConfigs';
 import GuardsFiroConfigs from '../configs/guardsFiroConfigs';
 import GuardsHandshakeConfigs from '../configs/guardsHandshakeConfigs';
+import { rosenConfig } from '../configs/rosenConfig';
 import { dataSource } from '../db/dataSource';
 import { TokenHandler } from '../handlers/tokenHandler';
 import {
   DEFAULT_BLOCK_CLEANUP_THRESHOLD_DURATION,
   DEFAULT_BLOCK_CLEANUP_TRIM,
 } from '../utils/constants';
+import { AvalancheScannerStartup } from './avalancheScannerStartup';
 
 const logger = DefaultLogger.getInstance().child(import.meta.url);
 
 let ergoScanner: ErgoScanner;
 let ethereumScanner: EvmRpcScanner;
 let binanceScanner: EvmRpcScanner;
+const avalancheStartup = new AvalancheScannerStartup(
+  () => readAvalancheConfig(config),
+  () => rosenConfig.avalancheBridgeContractReader(),
+  () => dataSource,
+);
+
+/** Prepares the configured Avalanche scanner before job registration. */
+export const prepareAvalancheScanner = (): Promise<void> =>
+  avalancheStartup.prepare();
+
+/** Returns the scanner inputs captured during startup preparation. */
+export const getPreparedAvalancheInputs = () =>
+  avalancheStartup.getPreparedInputs();
+
+/** Signing remains closed until the dedicated scanner has been registered. */
+export const getAvalancheScanner = (): AvalancheRpcScanner | undefined =>
+  avalancheStartup.getScanner();
 
 /**
  * runs ergo block scanner
@@ -172,7 +198,17 @@ const createLoggers = () => ({
 /**
  * initialize ergo scanner and extractors
  */
-const initScanner = () => {
+const initScanner = async () => {
+  await avalancheStartup.initialize({
+    logger,
+    blockCleanupConfig: {
+      blockCleanupThresholdDuration: DEFAULT_BLOCK_CLEANUP_THRESHOLD_DURATION,
+      blockTrimCountInRound: Configs.scannersBlockCleanup
+        .isActiveForNonErgoChains
+        ? DEFAULT_BLOCK_CLEANUP_TRIM
+        : 0,
+    },
+  });
   const loggers = createLoggers();
 
   const scannerConfig = {
@@ -207,6 +243,36 @@ const initScanner = () => {
     type: networkType,
     url: networkUrl,
   };
+
+  const avalanche = avalancheStartup.getPreparedInputs();
+  if (avalanche) {
+    const { addresses, tokens } = avalanche.contracts;
+    await ergoScanner.registerExtractor(
+      new CommitmentExtractor(
+        'avalancheCommitment',
+        [addresses.Commitment],
+        tokens.RWTId,
+        dataSource,
+        TokenHandler.getInstance().getTokenMap(),
+        { ...commitmentInitialization, address: addresses.Commitment },
+        logger,
+      ),
+    );
+    await ergoScanner.registerExtractor(
+      new EventTriggerExtractor(
+        'avalancheEventTrigger',
+        dataSource,
+        networkType,
+        networkUrl,
+        addresses.WatcherTriggerEvent,
+        tokens.RWTId,
+        addresses.WatcherPermit,
+        addresses.Fraud,
+        logger,
+        initialization,
+      ),
+    );
+  }
 
   // init Bitcoin extractors
   const bitcoinCommitmentExtractor = new CommitmentExtractor(
@@ -447,26 +513,27 @@ const initScanner = () => {
     initialization,
   );
 
-  ergoScanner.registerExtractor(bitcoinCommitmentExtractor);
-  ergoScanner.registerExtractor(bitcoinEventTriggerExtractor);
-  ergoScanner.registerExtractor(cardanoCommitmentExtractor);
-  ergoScanner.registerExtractor(cardanoEventTriggerExtractor);
-  ergoScanner.registerExtractor(ergoCommitmentExtractor);
-  ergoScanner.registerExtractor(ergoEventTriggerExtractor);
-  ergoScanner.registerExtractor(ethereumCommitmentExtractor);
-  ergoScanner.registerExtractor(ethereumEventTriggerExtractor);
-  ergoScanner.registerExtractor(dogeCommitmentExtractor);
-  ergoScanner.registerExtractor(dogeEventTriggerExtractor);
-  ergoScanner.registerExtractor(firoCommitmentExtractor);
-  ergoScanner.registerExtractor(firoEventTriggerExtractor);
-  ergoScanner.registerExtractor(handshakeCommitmentExtractor);
-  ergoScanner.registerExtractor(handshakeEventTriggerExtractor);
-  ergoScanner.registerExtractor(binanceCommitmentExtractor);
-  ergoScanner.registerExtractor(binanceEventTriggerExtractor);
-  ergoScanner.registerExtractor(bitcoinRunesCommitmentExtractor);
-  ergoScanner.registerExtractor(bitcoinRunesEventTriggerExtractor);
-
-  ergoScannerJob();
+  for (const extractor of [
+    bitcoinCommitmentExtractor,
+    bitcoinEventTriggerExtractor,
+    cardanoCommitmentExtractor,
+    cardanoEventTriggerExtractor,
+    ergoCommitmentExtractor,
+    ergoEventTriggerExtractor,
+    ethereumCommitmentExtractor,
+    ethereumEventTriggerExtractor,
+    dogeCommitmentExtractor,
+    dogeEventTriggerExtractor,
+    firoCommitmentExtractor,
+    firoEventTriggerExtractor,
+    handshakeCommitmentExtractor,
+    handshakeEventTriggerExtractor,
+    binanceCommitmentExtractor,
+    binanceEventTriggerExtractor,
+    bitcoinRunesCommitmentExtractor,
+    bitcoinRunesEventTriggerExtractor,
+  ])
+    await ergoScanner.registerExtractor(extractor);
 
   const nonErgoBlockCleanupConfig = {
     blockCleanupThresholdDuration: DEFAULT_BLOCK_CLEANUP_THRESHOLD_DURATION,
@@ -501,9 +568,7 @@ const initScanner = () => {
       GuardsEthereumConfigs.rpc.fastForward.checkNonceAtHeight,
       loggers.ethereumLockAddressTxExtractorLogger,
     );
-    ethereumScanner.registerExtractor(ethereumAddressTxExtractor);
-    // run ethereum scanner job
-    ethereumScannerJob();
+    await ethereumScanner.registerExtractor(ethereumAddressTxExtractor);
   }
 
   // init Binance scanner
@@ -532,10 +597,22 @@ const initScanner = () => {
       GuardsBinanceConfigs.rpc.fastForward.checkNonceAtHeight,
       loggers.binanceLockAddressTxExtractorLogger,
     );
-    binanceScanner.registerExtractor(BinanceAddressTxExtractor);
-    // run Binance scanner job
-    binanceScannerJob();
+    await binanceScanner.registerExtractor(BinanceAddressTxExtractor);
   }
+  scannersRegistered = true;
+};
+
+let scannersRegistered = false;
+let scannersStarted = false;
+/** Starts registered scanner jobs once, rejecting an unprepared or repeated start. */
+export const startScannerJobs = (): void => {
+  if (!scannersRegistered || scannersStarted)
+    throw new Error('Scanners are not registered or already started');
+  scannersStarted = true;
+  avalancheStartup.start();
+  ergoScannerJob();
+  if (ethereumScanner) ethereumScannerJob();
+  if (binanceScanner) binanceScannerJob();
 };
 
 export { initScanner };

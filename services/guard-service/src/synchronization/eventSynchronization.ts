@@ -25,7 +25,9 @@ import ChainHandler from '../handlers/chainHandler';
 import DetectionHandler from '../handlers/detectionHandler';
 import GuardPkHandler from '../handlers/guardPkHandler';
 import MinimumFeeHandler from '../handlers/minimumFeeHandler';
+import { getAvalancheScanner } from '../jobs/initScanner';
 import * as TransactionSerializer from '../transaction/transactionSerializer';
+import { AvalancheTransactionSafety } from '../utils/avalancheTransactionSafety';
 import { TransactionStatus } from '../utils/constants';
 import GuardTurn from '../utils/guardTurn';
 import {
@@ -90,7 +92,8 @@ class EventSynchronization extends Communicator {
   ): string => {
     if (tx.network === 'ergo' && actualTxId !== tx.txId)
       throw new Error('Synchronization Ergo settlement identity mismatch');
-    if (!['ethereum', 'binance'].includes(tx.network)) return actualTxId;
+    if (!['avalanche', 'ethereum', 'binance'].includes(tx.network))
+      return actualTxId;
     const signed = Transaction.from(
       '0x' + Buffer.from(tx.txBytes).toString('hex'),
     );
@@ -105,7 +108,13 @@ class EventSynchronization extends Communicator {
     return signed.hash!;
   };
 
-  protected constructor(detection: GuardDetection) {
+  protected constructor(
+    detection: GuardDetection,
+    private readonly transactionSafety = new AvalancheTransactionSafety(
+      (id) => DatabaseAction.getInstance().getEventById(id),
+      getAvalancheScanner,
+    ),
+  ) {
     super(
       logger,
       Configs.tssKeys.encryptor,
@@ -624,43 +633,45 @@ class EventSynchronization extends Communicator {
       }
       const expectedEvent = structuredClone(event);
       const requiredSign = this.requiredApproval + 1;
-
-      this.assertGuardAuthority();
-
-      // A quorum may have waited behind another approval.
-      // Repeat verification before admitting the current payment.
-      if (
-        this.activeSyncMap.get(tx.eventId) !== active ||
-        !(await this.verifySynchronizationResponse(tx, actualTxId))
-      )
-        throw new Error('Synchronization payment is no longer verified');
-
-      const currentHeight = await ChainHandler.getInstance()
-        .getChain(tx.network)
-        .getHeight();
-
-      this.assertGuardAuthority();
-
-      if (
-        tx.toJson() !== json ||
-        this.activeSyncMap.get(tx.eventId) !== active ||
-        !Number.isSafeInteger(currentHeight) ||
-        currentHeight < 0
-      )
-        throw new Error('Synchronization context or height changed');
-
-      if (
-        !(await dbAction.insertSynchronizedPaymentIfUnchanged(
-          tx,
-          expectedEvent,
-          requiredSign,
-          currentHeight,
-          this.assertGuardAuthority,
-        ))
-      )
-        throw new Error('Synchronization persistence conflict');
-
-      this.activeSyncMap.delete(tx.eventId);
+      const bound = await this.transactionSafety.bindTransaction({
+        network: tx.network,
+        eventId: tx.eventId,
+        txType: tx.txType,
+        txId: tx.txId,
+        txBytes: Buffer.from(tx.txBytes).toString('hex'),
+      });
+      await bound.withAction(async () => {
+        this.assertGuardAuthority();
+        // A quorum may have waited behind another approval or a scanner update.
+        // Repeat payment verification under the current observation lease.
+        if (
+          this.activeSyncMap.get(tx.eventId) !== active ||
+          !(await this.verifySynchronizationResponse(tx, actualTxId))
+        )
+          throw new Error('Synchronization payment is no longer verified');
+        const currentHeight = await ChainHandler.getInstance()
+          .getChain(tx.network)
+          .getHeight();
+        this.assertGuardAuthority();
+        if (
+          tx.toJson() !== json ||
+          this.activeSyncMap.get(tx.eventId) !== active ||
+          !Number.isSafeInteger(currentHeight) ||
+          currentHeight < 0
+        )
+          throw new Error('Synchronization context or height changed');
+        if (
+          !(await dbAction.insertSynchronizedPaymentIfUnchanged(
+            tx,
+            expectedEvent,
+            requiredSign,
+            currentHeight,
+            this.assertGuardAuthority,
+          ))
+        )
+          throw new Error('Synchronization persistence conflict');
+        this.activeSyncMap.delete(tx.eventId);
+      });
     } catch (e) {
       logger.warn(
         `An error occurred while finalizing event [${tx.eventId}] synchronization: ${e}`,
