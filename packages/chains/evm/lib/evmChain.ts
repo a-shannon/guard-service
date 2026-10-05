@@ -40,6 +40,17 @@ abstract class EvmChain extends AbstractChain<Transaction> {
   supportedTokens: Array<string> = [];
   protected signMediator: EcdsaSignMediator;
 
+  /**
+   * Configures EVM payment construction, extraction and token-map updates.
+   * @param network - Network used to read chain state and estimate payments.
+   * @param configs - Chain payment and verification settings.
+   * @param tokens - Token map used to select supported assets.
+   * @param signMediator - Mediator for ECDSA signing requests.
+   * @param CHAIN - Chain key used by the extractor and token map.
+   * @param NATIVE_TOKEN_ID - Native asset identifier.
+   * @param evmTxType - EVM transaction type; defaults to zero.
+   * @param logger - Optional chain logger.
+   */
   constructor(
     network: AbstractEvmNetwork,
     configs: EvmConfigs,
@@ -60,6 +71,7 @@ abstract class EvmChain extends AbstractChain<Transaction> {
       NATIVE_TOKEN_ID,
       logger?.child(`evmRosenExtractor`),
     );
+    /** Refreshes nonnative token identifiers from the current chain's token map. */
     const updateSupportedTokens = () => {
       const supportedTokens = tokens
         .getConfig()
@@ -251,14 +263,8 @@ abstract class EvmChain extends AbstractChain<Transaction> {
           ...txFeeData,
         });
       }
-      let estimatedRequiredGas = await this.network.getGasRequired(trx);
-      if (estimatedRequiredGas > this.configs.gasLimitCap) {
-        this.logger.warn(
-          `Estimated required gas is more than gas limit cap config and cap is used for the tx [${estimatedRequiredGas} > ${this.configs.gasLimitCap}]`,
-        );
-        estimatedRequiredGas = this.configs.gasLimitCap;
-      }
-      trx.gasLimit = estimatedRequiredGas * this.configs.gasLimitMultiplier;
+      const estimatedRequiredGas = await this.network.getGasRequired(trx);
+      trx.gasLimit = this.getGasLimit(estimatedRequiredGas);
 
       evmTrxs.push(
         new PaymentTransaction(
@@ -281,6 +287,26 @@ abstract class EvmChain extends AbstractChain<Transaction> {
 
     return evmTrxs;
   };
+
+  /** Converts the network estimate to the configured transaction gas limit. */
+  protected getGasLimit(estimate: bigint): bigint {
+    if (estimate > this.configs.gasLimitCap) {
+      this.logger.warn(
+        `Estimated required gas is more than gas limit cap config and cap is used for the tx [${estimate} > ${this.configs.gasLimitCap}]`,
+      );
+      estimate = this.configs.gasLimitCap;
+    }
+    return estimate * this.configs.gasLimitMultiplier;
+  }
+
+  /** Checks the proposed gas limit against this chain's estimation policy. */
+  protected verifyGasLimit(actual: bigint, estimate: bigint): boolean {
+    const expected = this.getGasLimit(estimate);
+    const slippage = (expected * BigInt(this.configs.gasLimitSlippage)) / 100n;
+    const difference =
+      actual >= expected ? actual - expected : expected - actual;
+    return difference <= slippage;
+  }
 
   /**
    * gets input and output assets of a PaymentTransaction
@@ -450,25 +476,11 @@ abstract class EvmChain extends AbstractChain<Transaction> {
     }
 
     // check gas limit
-    let estimatedRequiredGas = await this.network.getGasRequired(tx);
-    if (estimatedRequiredGas > this.configs.gasLimitCap) {
-      this.logger.info(
-        `Estimated required gas is more than gas limit cap config and cap is used for verification [${estimatedRequiredGas} > ${this.configs.gasLimitCap}]`,
-      );
-      estimatedRequiredGas = this.configs.gasLimitCap;
-    }
-    const gasRequired = estimatedRequiredGas * this.configs.gasLimitMultiplier;
-    const gasLimitSlippage =
-      (gasRequired * BigInt(this.configs.gasLimitSlippage)) / 100n;
-    const gasDifference =
-      tx.gasLimit >= gasRequired
-        ? tx.gasLimit - gasRequired
-        : gasRequired - tx.gasLimit;
-
-    if (gasDifference > gasLimitSlippage) {
+    const estimatedRequiredGas = await this.network.getGasRequired(tx);
+    if (!this.verifyGasLimit(tx.gasLimit, estimatedRequiredGas)) {
       this.logger.warn(
         baseError +
-          `Transaction gas limit [${tx.gasLimit}] is too far from calculated gas limit [${gasRequired}]`,
+          `Transaction gas limit [${tx.gasLimit}] does not satisfy the policy for estimated gas [${estimatedRequiredGas}]`,
       );
       return false;
     }
