@@ -7,6 +7,8 @@ import {
 
 import RosenDialer from '../communication/rosenDialer';
 import Configs from '../configs/configs';
+import { createErgoSigningAuthorization } from '../signing/ergoSigningAuthorization';
+import type { GuardSigningRuntime } from '../signing/signingRuntime';
 import DetectionHandler from './detectionHandler';
 
 const logger = DefaultLogger.getInstance().child(import.meta.url);
@@ -17,7 +19,10 @@ class MultiSigHandler {
   protected static dialer: RosenDialerNode;
   protected ergoMultiSig: ErgoMultiSig;
 
-  private constructor(multiSigUtilsInstance: MultiSigUtils) {
+  private constructor(
+    multiSigUtilsInstance: MultiSigUtils,
+    runtime: GuardSigningRuntime,
+  ) {
     this.ergoMultiSig = new ErgoMultiSig({
       logger: DefaultLogger.getInstance().child('MultiSig'),
       multiSigUtilsInstance: multiSigUtilsInstance,
@@ -30,12 +35,21 @@ class MultiSigHandler {
       commGuardsPk: Configs.tssKeys.pubs.map((p) => p.curvePub),
       ergoGuardPks: [],
       turnTime: Configs.multiSigTurnTime,
+      signingAuthorization: createErgoSigningAuthorization(runtime),
     });
   }
 
-  static init = async (multiSigUtilsInstance: MultiSigUtils) => {
+  static init = async (
+    multiSigUtilsInstance: MultiSigUtils,
+    runtime: GuardSigningRuntime,
+  ) => {
+    if (!runtime?.context || !runtime.ergo)
+      throw new Error('Signing runtime is required');
     MultiSigHandler.dialer = RosenDialer.getInstance().getDialer();
-    MultiSigHandler.instance = new MultiSigHandler(multiSigUtilsInstance);
+    MultiSigHandler.instance = new MultiSigHandler(
+      multiSigUtilsInstance,
+      runtime,
+    );
 
     // subscribe to channels
     MultiSigHandler.dialer.subscribeChannel(

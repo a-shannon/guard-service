@@ -2,12 +2,7 @@ import { spawn } from 'child_process';
 
 import { DefaultLogger } from '@rosen-bridge/abstract-logger';
 import { RosenDialerNode } from '@rosen-bridge/dialer';
-import {
-  EcdsaSigner,
-  EddsaSigner,
-  StatusEnum,
-  TssSigner,
-} from '@rosen-bridge/tss';
+import { StatusEnum, TssSigner } from '@rosen-bridge/tss';
 import {
   EcdsaSignMediator,
   EcdsaSignResponse,
@@ -16,6 +11,11 @@ import {
 
 import RosenDialer from '../communication/rosenDialer';
 import Configs from '../configs/configs';
+import {
+  QualifiedEcdsaSigner,
+  QualifiedEddsaSigner,
+} from '../signing/qualifiedTssSigner';
+import type { GuardSigningRuntime } from '../signing/signingRuntime';
 import { TssAlgorithms } from '../utils/constants';
 import DetectionHandler from './detectionHandler';
 
@@ -31,6 +31,7 @@ class TssHandler {
   protected static tssEdwardSigner: TssSigner;
   protected static dialer: RosenDialerNode;
   protected static tssApiKey: string;
+  private static signingRuntime: GuardSigningRuntime;
 
   protected constructor() {
     // do nothing.
@@ -97,7 +98,10 @@ class TssHandler {
   /**
    * initializes tss prerequisites
    */
-  static init = async () => {
+  static init = async (runtime: GuardSigningRuntime) => {
+    if (!runtime?.context || !runtime.registry)
+      throw new Error('Signing runtime is required');
+    TssHandler.signingRuntime = runtime;
     TssHandler.instance = new TssHandler();
     TssHandler.runBinary();
 
@@ -117,20 +121,26 @@ class TssHandler {
     const tssPks = Configs.tssKeys.pubs.map((pub) => pub.curvePub);
     const shareIds = Configs.tssKeys.pubs.map((pub) => pub.curveShareId);
 
-    TssHandler.tssCurveSigner = new EcdsaSigner({
-      tssApiUrl: `${Configs.tssUrl}:${Configs.tssPort}`,
-      getPeerId: () => Promise.resolve(TssHandler.dialer.getDialerId()),
-      callbackUrl: Configs.tssBaseCallBackUrl + '/' + TssAlgorithms.curve,
-      shares: shareIds,
-      submitMsg: this.generateSubmitMessageWrapper(TssHandler.CHANNELS.curve),
-      messageEnc: Configs.tssKeys.encryptor,
-      detection: DetectionHandler.getInstance().getDetection(),
-      guardsPk: tssPks,
-      signPerRoundLimit: Configs.tssParallelSignCount,
-      timeoutSeconds: Configs.curveSignTimeout,
-      signCacheTTLSeconds: Configs.signCacheTtl,
-      logger: DefaultLogger.getInstance().child('tssSigner'),
-    });
+    TssHandler.tssCurveSigner = new QualifiedEcdsaSigner(
+      {
+        tssApiUrl: `${Configs.tssUrl}:${Configs.tssPort}`,
+        getPeerId: () => Promise.resolve(TssHandler.dialer.getDialerId()),
+        callbackUrl: Configs.tssBaseCallBackUrl + '/' + TssAlgorithms.curve,
+        shares: shareIds,
+        submitMsg: this.generateSubmitMessageWrapper(TssHandler.CHANNELS.curve),
+        messageEnc: Configs.tssKeys.encryptor,
+        detection: DetectionHandler.getInstance().getDetection(),
+        guardsPk: tssPks,
+        signPerRoundLimit: Configs.tssParallelSignCount,
+        timeoutSeconds: Configs.curveSignTimeout,
+        signCacheTTLSeconds: Configs.signCacheTtl,
+        logger: DefaultLogger.getInstance().child('tssSigner'),
+      },
+      {
+        ...TssHandler.signingRuntime.curve,
+        policy: TssHandler.signingRuntime.registry,
+      },
+    );
 
     // subscribe to channel
     TssHandler.dialer.subscribeChannel(
@@ -148,20 +158,28 @@ class TssHandler {
     const tssPks = Configs.tssKeys.pubs.map((pub) => pub.curvePub);
     const shareIds = Configs.tssKeys.pubs.map((pub) => pub.edwardShareId);
 
-    TssHandler.tssEdwardSigner = new EddsaSigner({
-      tssApiUrl: `${Configs.tssUrl}:${Configs.tssPort}`,
-      getPeerId: () => Promise.resolve(TssHandler.dialer.getDialerId()),
-      callbackUrl: Configs.tssBaseCallBackUrl + '/' + TssAlgorithms.edward,
-      shares: shareIds,
-      submitMsg: this.generateSubmitMessageWrapper(TssHandler.CHANNELS.edward),
-      messageEnc: Configs.tssKeys.encryptor,
-      detection: DetectionHandler.getInstance().getDetection(),
-      guardsPk: tssPks,
-      signPerRoundLimit: Configs.tssParallelSignCount,
-      timeoutSeconds: Configs.edwardSignTimeout,
-      signCacheTTLSeconds: Configs.signCacheTtl,
-      logger: DefaultLogger.getInstance().child('tssSigner'),
-    });
+    TssHandler.tssEdwardSigner = new QualifiedEddsaSigner(
+      {
+        tssApiUrl: `${Configs.tssUrl}:${Configs.tssPort}`,
+        getPeerId: () => Promise.resolve(TssHandler.dialer.getDialerId()),
+        callbackUrl: Configs.tssBaseCallBackUrl + '/' + TssAlgorithms.edward,
+        shares: shareIds,
+        submitMsg: this.generateSubmitMessageWrapper(
+          TssHandler.CHANNELS.edward,
+        ),
+        messageEnc: Configs.tssKeys.encryptor,
+        detection: DetectionHandler.getInstance().getDetection(),
+        guardsPk: tssPks,
+        signPerRoundLimit: Configs.tssParallelSignCount,
+        timeoutSeconds: Configs.edwardSignTimeout,
+        signCacheTTLSeconds: Configs.signCacheTtl,
+        logger: DefaultLogger.getInstance().child('tssSigner'),
+      },
+      {
+        ...TssHandler.signingRuntime.edward,
+        policy: TssHandler.signingRuntime.registry,
+      },
+    );
 
     // subscribe to channel
     TssHandler.dialer.subscribeChannel(
@@ -238,6 +256,11 @@ class TssHandler {
     chainCode: string,
     derivationPath: number[],
   ): EcdsaSignMediator => {
+    const key = Object.freeze({
+      algorithm: 'ecdsa' as const,
+      chainCode,
+      derivationPath: Object.freeze([...derivationPath]),
+    });
     return {
       isInSign: async (txHash: Uint8Array) => {
         return TssHandler.tssCurveSigner.isInSign(
@@ -245,10 +268,13 @@ class TssHandler {
         );
       },
       sign: async (txHash: Uint8Array): Promise<EcdsaSignResponse> => {
-        const res = await TssHandler.tssCurveSigner.signPromised(
-          Buffer.from(txHash).toString('hex'),
-          chainCode,
-          derivationPath,
+        const message = Buffer.from(txHash).toString('hex');
+        const res = await TssHandler.signingRuntime.context.withTssKey(
+          key,
+          () =>
+            TssHandler.tssCurveSigner.signPromised(message, key.chainCode, [
+              ...key.derivationPath,
+            ]),
         );
         return {
           signature: res.signature,
@@ -264,6 +290,7 @@ class TssHandler {
    * and another to check if a message is in sign or not
    */
   wrapEdwardSignMediator = (chainCode: string): EddsaSignMediator => {
+    const key = Object.freeze({ algorithm: 'eddsa' as const, chainCode });
     return {
       isInSign: async (txHash: Uint8Array) => {
         return TssHandler.tssEdwardSigner.isInSign(
@@ -271,9 +298,10 @@ class TssHandler {
         );
       },
       sign: async (txHash: Uint8Array): Promise<string> => {
-        const res = await TssHandler.tssEdwardSigner.signPromised(
-          Buffer.from(txHash).toString('hex'),
-          chainCode,
+        const message = Buffer.from(txHash).toString('hex');
+        const res = await TssHandler.signingRuntime.context.withTssKey(
+          key,
+          () => TssHandler.tssEdwardSigner.signPromised(message, key.chainCode),
         );
         return res.signature;
       },
@@ -284,7 +312,18 @@ class TssHandler {
    * returns (EdDSA) signer signer function
    */
   get edwardSign() {
-    return TssHandler.tssEdwardSigner.signPromised;
+    return async (
+      message: string,
+      chainCode: string,
+      derivationPath?: number[],
+    ) => {
+      if (derivationPath !== undefined)
+        throw new Error('EdDSA does not use a derivation path');
+      const key = Object.freeze({ algorithm: 'eddsa' as const, chainCode });
+      return TssHandler.signingRuntime.context.withTssKey(key, () =>
+        TssHandler.tssEdwardSigner.signPromised(message, key.chainCode),
+      );
+    };
   }
 
   /**

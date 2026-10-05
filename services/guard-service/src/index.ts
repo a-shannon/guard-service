@@ -7,6 +7,7 @@ import ArbitraryProcessor from './arbitrary/arbitraryProcessor';
 import RosenDialer from './communication/rosenDialer';
 import Configs from './configs/configs';
 import { DatabaseAction } from './db/databaseAction';
+import DatabaseHandler from './db/databaseHandler';
 import { dataSource } from './db/dataSource';
 import BalanceHandler from './handlers/balanceHandler';
 import ChainHandler from './handlers/chainHandler';
@@ -22,14 +23,24 @@ import { initApiServer } from './jobs/apiServer';
 import { initDataSources } from './jobs/dataSources';
 import { configUpdateJob } from './jobs/guardConfigUpdate';
 import { healthCheckStart } from './jobs/healthCheck';
-import { initScanner } from './jobs/initScanner';
+import {
+  initScanner,
+  getAvalancheScanner,
+  prepareAvalancheScanner,
+  getPreparedAvalancheInputs,
+} from './jobs/initScanner';
 import { minimumFeeUpdateJob } from './jobs/minimumFee';
 import { initializeMultiSigJobs } from './jobs/multiSig';
 import { revenueJob } from './jobs/revenue';
 import { runProcessors } from './jobs/runProcessors';
 import { tssUpdateJob } from './jobs/tss';
 import EventReprocess from './reprocess/eventReprocess';
+import { createGuardSigningRuntime } from './signing/signingRuntime';
 import EventSynchronization from './synchronization/eventSynchronization';
+import TransactionProcessor from './transaction/transactionProcessor';
+import * as TransactionSerializer from './transaction/transactionSerializer';
+import { createAvalancheManagementDependencies } from './verification/avalancheManagementDependencies';
+import RewardAuthorization from './verification/rewardAuthorization';
 
 const init = async () => {
   // initialize tokens config
@@ -43,6 +54,40 @@ const init = async () => {
 
   // initialize DatabaseAction
   DatabaseAction.init(dataSource);
+  await prepareAvalancheScanner();
+  const avalancheInputs = getPreparedAvalancheInputs();
+  if (avalancheInputs) await TokenHandler.getInstance().sealForAvalanche();
+  ChainHandler.prepareStartup(avalancheInputs);
+
+  const database = DatabaseAction.getInstance();
+  const signing = createGuardSigningRuntime({
+    getEvent: database.getEventById,
+    getTx: database.getTxById,
+    decode: (json) =>
+      TransactionSerializer.fromJson(json, ChainHandler.getInstance().getChain),
+    getScanner: getAvalancheScanner,
+    curveTimeoutSeconds: Configs.curveSignTimeout,
+    edwardTimeoutSeconds: Configs.edwardSignTimeout,
+    ergoTimeoutSeconds: Configs.multiSigSignTimeout,
+    maxPending: Configs.tssParallelSignCount,
+    management: createAvalancheManagementDependencies({
+      getInputs: () => avalancheInputs,
+      getChain: () => ChainHandler.getInstance().getChain('avalanche'),
+      getDatabase: () => DatabaseAction.getInstance(),
+      decode: (json) =>
+        TransactionSerializer.fromJson(
+          json,
+          ChainHandler.getInstance().getChain,
+        ),
+      getThresholds: Configs.thresholds,
+      getWaitingTokens: DatabaseHandler.getWaitingEventsRequiredTokens,
+      manualRequests: () => Configs.isManualTxRequestActive,
+      arbitraryRequests: () => Configs.isArbitraryOrderRequestActive,
+      guardsCount: () => GuardPkHandler.getInstance().guardsLen,
+    }),
+  });
+  TransactionProcessor.initSigning(signing.context, signing.processor);
+  RewardAuthorization.init(signing.context);
 
   // initialize PublicStatusHandler
   PublicStatusHandler.init(dataSource);
@@ -61,11 +106,11 @@ const init = async () => {
     ChainHandler.getInstance().getErgoChain().getStateContext(),
   );
   // initialize tss multiSig object
-  await MultiSigHandler.init(multiSigUtils);
+  await MultiSigHandler.init(multiSigUtils, signing);
   initializeMultiSigJobs();
 
   // start tss instance
-  await TssHandler.init();
+  await TssHandler.init(signing);
   tssUpdateJob();
 
   // initialize chain objects
