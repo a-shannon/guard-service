@@ -402,7 +402,9 @@ class ErgoChain extends AbstractUtxoChain<wasm.Transaction, wasm.ErgoBox> {
    */
   getTransactionAssets = async (
     transaction: PaymentTransaction,
+    signingStatus: SigningStatus = SigningStatus.UnSigned,
   ): Promise<TransactionAssetBalance> => {
+    const tx = this.accountingTransaction(transaction, signingStatus);
     const ergoTx = transaction as ErgoTransaction;
     let inputAssets: AssetBalance = {
       nativeToken: 0n,
@@ -416,7 +418,6 @@ class ErgoChain extends AbstractUtxoChain<wasm.Transaction, wasm.ErgoBox> {
       inputAssets = ChainUtils.sumAssetBalance(inputAssets, boxAssets);
     });
 
-    const tx = Serializer.deserialize(transaction.txBytes).unsigned_tx();
     const outputAssets: AssetBalance = {
       nativeToken: 0n,
       tokens: [],
@@ -459,13 +460,95 @@ class ErgoChain extends AbstractUtxoChain<wasm.Transaction, wasm.ErgoBox> {
     };
   };
 
+  /** Signed accounting binds auxiliary box values to the serialized inputs.
+   * This checks model consistency, not spending proofs or event authority.
+   * The legacy reduced path retains its existing caller-validation contract.
+   */
+  private accountingTransaction = (
+    transaction: PaymentTransaction,
+    signingStatus: SigningStatus,
+  ): wasm.Transaction | wasm.UnsignedTransaction => {
+    if (![SigningStatus.Signed, SigningStatus.UnSigned].includes(signingStatus))
+      throw new Error('Invalid transaction signing status');
+    if (signingStatus === SigningStatus.UnSigned)
+      return Serializer.deserialize(transaction.txBytes).unsigned_tx();
+    const tx = Serializer.signedDeserialize(transaction.txBytes);
+    if (
+      transaction.network !== ERGO_CHAIN ||
+      tx.id().to_str() !== transaction.txId ||
+      !Buffer.from(tx.sigma_serialize_bytes()).equals(
+        Buffer.from(transaction.txBytes),
+      )
+    )
+      throw new Error('Signed Ergo accounting identity mismatch');
+    const ergoTx = transaction as ErgoTransaction;
+    /** Checks ordered box identities, counts and canonical serialized bytes. */
+    const checkBoxes = (boxes: Uint8Array[], ids: string[]) => {
+      if (
+        !Array.isArray(boxes) ||
+        boxes.length !== ids.length ||
+        new Set(ids).size !== ids.length
+      )
+        throw new Error(
+          'Signed Ergo accounting box count or identity mismatch',
+        );
+      for (let index = 0; index < ids.length; index++) {
+        if (!(boxes[index] instanceof Uint8Array))
+          throw new Error('Invalid signed Ergo accounting box bytes');
+        const box = wasm.ErgoBox.sigma_parse_bytes(boxes[index]);
+        if (
+          box.box_id().to_str() !== ids[index] ||
+          !Buffer.from(box.sigma_serialize_bytes()).equals(
+            Buffer.from(boxes[index]),
+          )
+        )
+          throw new Error('Signed Ergo accounting box identity mismatch');
+      }
+    };
+    const inputs = tx.inputs();
+    const dataInputs = tx.data_inputs();
+    checkBoxes(
+      ergoTx.inputBoxes,
+      Array.from({ length: inputs.len() }, (_, index) =>
+        inputs.get(index).box_id().to_str(),
+      ),
+    );
+    checkBoxes(
+      ergoTx.dataInputs,
+      Array.from({ length: dataInputs.len() }, (_, index) =>
+        dataInputs.get(index).box_id().to_str(),
+      ),
+    );
+    return tx;
+  };
+
+  /** Compares input and output assets using the selected signing status. */
+  verifyNoTokenBurned = async (
+    transaction: PaymentTransaction,
+    signingStatus: SigningStatus = SigningStatus.UnSigned,
+  ): Promise<boolean> => {
+    const assets = await this.getTransactionAssets(transaction, signingStatus);
+    return ChainUtils.isEqualAssetBalance(
+      assets.inputAssets,
+      assets.outputAssets,
+    );
+  };
+
   /**
    * extracts payment order of a PaymentTransaction
    * @param transaction the PaymentTransaction
    * @returns the transaction payment order (list of single payments)
    */
-  extractTransactionOrder = (transaction: PaymentTransaction): PaymentOrder => {
-    const tx = Serializer.deserialize(transaction.txBytes).unsigned_tx();
+  extractTransactionOrder = (
+    transaction: PaymentTransaction,
+    signingStatus: SigningStatus = SigningStatus.UnSigned,
+  ): PaymentOrder => {
+    if (![SigningStatus.Signed, SigningStatus.UnSigned].includes(signingStatus))
+      throw new Error('Invalid transaction signing status');
+    const tx =
+      signingStatus === SigningStatus.Signed
+        ? Serializer.signedDeserialize(transaction.txBytes)
+        : Serializer.deserialize(transaction.txBytes).unsigned_tx();
     const lockErgoTree = wasm.Address.from_base58(this.configs.addresses.lock)
       .to_ergo_tree()
       .to_base16_bytes();
@@ -518,8 +601,9 @@ class ErgoChain extends AbstractUtxoChain<wasm.Transaction, wasm.ErgoBox> {
    */
   verifyTransactionFee = async (
     transaction: PaymentTransaction,
+    signingStatus: SigningStatus = SigningStatus.UnSigned,
   ): Promise<boolean> => {
-    const tx = Serializer.deserialize(transaction.txBytes).unsigned_tx();
+    const tx = this.accountingTransaction(transaction, signingStatus);
     const outputBoxes = tx.output_candidates();
     for (let i = 0; i < outputBoxes.len(); i++) {
       const box = outputBoxes.get(i);
@@ -788,7 +872,7 @@ class ErgoChain extends AbstractUtxoChain<wasm.Transaction, wasm.ErgoBox> {
   };
 
   /** Submits captured signed bytes and preserves authorized failure handling. */
-private submitCapturedTransaction = async (
+  private submitCapturedTransaction = async (
     transaction: PaymentTransaction,
     authorization?: Pick<
       AuthorizedErgoSubmission,
@@ -1185,12 +1269,16 @@ private submitCapturedTransaction = async (
    * @param txId
    * @param blockId
    */
-  getTransaction = async (txId: string, blockId: string): Promise<string> =>
-    Buffer.from(
-      Serializer.signedSerialize(
-        await this.network.getTransaction(txId, blockId),
-      ),
-    ).toString('hex');
+  getTransaction = async (txId: string, blockId: string): Promise<string> => {
+    const transaction = await this.network.getTransaction(txId, blockId);
+    try {
+      return Buffer.from(Serializer.signedSerialize(transaction)).toString(
+        'hex',
+      );
+    } finally {
+      transaction.free();
+    }
+  };
 
   /**
    * generates PaymentTransaction object from raw tx json string
@@ -1262,8 +1350,14 @@ private submitCapturedTransaction = async (
    */
   verifyPaymentTransaction = async (
     transaction: PaymentTransaction,
+    signingStatus: SigningStatus = SigningStatus.UnSigned,
   ): Promise<boolean> => {
-    const tx = Serializer.deserialize(transaction.txBytes).unsigned_tx();
+    if (![SigningStatus.Signed, SigningStatus.UnSigned].includes(signingStatus))
+      throw new Error('Invalid transaction signing status');
+    const tx =
+      signingStatus === SigningStatus.Signed
+        ? Serializer.signedDeserialize(transaction.txBytes)
+        : Serializer.deserialize(transaction.txBytes).unsigned_tx();
     const ergoTx = transaction as ErgoTransaction;
     const baseError = `Tx [${transaction.txId}] is not verified: `;
 
