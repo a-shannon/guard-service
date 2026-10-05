@@ -19,6 +19,7 @@ export class ChainAddressBalanceEntity {
   @Column('varchar')
   lastUpdate: string;
 
-  @Column({ type: 'bigint', transformer: new BigIntValueTransformer() })
+  // SQLite numeric affinity otherwise passes large integers through JS numbers.
+  @Column({ type: 'text', transformer: new BigIntValueTransformer() })
   balance: bigint;
 }
