@@ -1,4 +1,5 @@
-import { isEqual, sampleSize, countBy, shuffle } from 'lodash-es';
+import { Transaction } from 'ethers';
+import { isEqual, sampleSize, shuffle } from 'lodash-es';
 
 import { DefaultLogger } from '@rosen-bridge/abstract-logger';
 import { Communicator } from '@rosen-bridge/communication';
@@ -12,10 +13,12 @@ import {
   SigningStatus,
   TransactionType,
 } from '@rosen-chains/abstract-chain';
+import { ErgoChain } from '@rosen-chains/ergo';
 
 import RosenDialer from '../communication/rosenDialer';
 import Configs from '../configs/configs';
 import { DatabaseAction } from '../db/databaseAction';
+import EventBoxes from '../event/eventBoxes';
 import EventOrder from '../event/eventOrder';
 import EventSerializer from '../event/eventSerializer';
 import ChainHandler from '../handlers/chainHandler';
@@ -23,7 +26,7 @@ import DetectionHandler from '../handlers/detectionHandler';
 import GuardPkHandler from '../handlers/guardPkHandler';
 import MinimumFeeHandler from '../handlers/minimumFeeHandler';
 import * as TransactionSerializer from '../transaction/transactionSerializer';
-import { EventStatus, TransactionStatus } from '../utils/constants';
+import { TransactionStatus } from '../utils/constants';
 import GuardTurn from '../utils/guardTurn';
 import {
   ActiveSync,
@@ -46,6 +49,61 @@ class EventSynchronization extends Communicator {
   protected parallelSyncLimit: number;
   protected parallelRequestCount: number;
   protected requiredApproval: number;
+  private readonly guardAuthority: string;
+  private readonly responseJson = new WeakMap<PaymentTransaction, string>();
+
+  /** Captures signing and communication configuration for rotation checks. */
+  private guardFingerprint = (): string => {
+    const guards = GuardPkHandler.getInstance();
+    return JSON.stringify({
+      requiredSign: guards.requiredSign,
+      publicKeys: guards.publicKeys,
+      guardsLen: guards.guardsLen,
+      guardId: guards.guardId,
+      communicationKeys: this.guardPks,
+    });
+  };
+
+  /** Configured communication identities require a restart after guard rotation. */
+  private assertGuardAuthority = (): void => {
+    if (this.guardFingerprint() !== this.guardAuthority)
+      throw new Error(
+        'Synchronization guard configuration changed; restart required',
+      );
+  };
+
+  /** Copies a payment model and rejects a noncanonical JSON round trip. */
+  private copyPayment = (json: string): PaymentTransaction => {
+    const copy = TransactionSerializer.fromJson(
+      json,
+      ChainHandler.getInstance().getChain,
+    );
+    if (copy.toJson() !== json)
+      throw new Error('Synchronization payment model did not round-trip');
+    return copy;
+  };
+
+  /** EVM model IDs are unsigned hashes; settlement IDs commit to signed bytes. */
+  private bindActualTransactionId = (
+    tx: PaymentTransaction,
+    actualTxId: string,
+  ): string => {
+    if (tx.network === 'ergo' && actualTxId !== tx.txId)
+      throw new Error('Synchronization Ergo settlement identity mismatch');
+    if (!['ethereum', 'binance'].includes(tx.network)) return actualTxId;
+    const signed = Transaction.from(
+      '0x' + Buffer.from(tx.txBytes).toString('hex'),
+    );
+    if (
+      !signed.isSigned() ||
+      signed.unsignedHash !== tx.txId ||
+      typeof actualTxId !== 'string' ||
+      !/^0x[0-9a-fA-F]{64}$/.test(actualTxId) ||
+      signed.hash !== actualTxId.toLowerCase()
+    )
+      throw new Error('Synchronization signed transaction identity mismatch');
+    return signed.hash!;
+  };
 
   protected constructor(detection: GuardDetection) {
     super(
@@ -62,6 +120,12 @@ class EventSynchronization extends Communicator {
     this.parallelSyncLimit = Configs.parallelSyncLimit;
     this.parallelRequestCount = Configs.parallelRequestCount;
     this.requiredApproval = GuardPkHandler.getInstance().requiredSign - 1;
+    if (
+      !Number.isSafeInteger(this.requiredApproval) ||
+      this.requiredApproval < 0
+    )
+      throw new Error('Invalid synchronization quorum');
+    this.guardAuthority = this.guardFingerprint();
   }
 
   /**
@@ -139,6 +203,7 @@ class EventSynchronization extends Communicator {
    * verifies events in the queue and starts synchronization process for them
    */
   processSyncQueue = async (): Promise<void> => {
+    this.assertGuardAuthority();
     if (this.eventQueue.length === 0) {
       logger.info(`No event to sync`);
       return;
@@ -368,28 +433,52 @@ class EventSynchronization extends Communicator {
     actualTxId: string,
     senderIndex: number,
   ): Promise<void> => {
-    if (!(await this.verifySynchronizationResponse(tx, actualTxId))) return;
+    const json = tx.toJson();
+    this.assertGuardAuthority();
+    const candidate = this.copyPayment(json);
+    const activeSync = this.activeSyncMap.get(candidate.eventId);
+    if (
+      !activeSync ||
+      !Number.isSafeInteger(senderIndex) ||
+      senderIndex < 0 ||
+      senderIndex >= activeSync.responses.length ||
+      senderIndex >= this.guardPks.length ||
+      activeSync.responses[senderIndex] !== undefined
+    )
+      return;
+    if (!(await this.verifySynchronizationResponse(candidate, actualTxId)))
+      return;
+    this.assertGuardAuthority();
+    if (candidate.toJson() !== json)
+      throw new Error('Synchronization candidate changed during verification');
     logger.info(
-      `Guard [${senderIndex}] responded the sync request of event [${tx.eventId}] with transaction [${tx.txId}]`,
+      `Guard [${senderIndex}] responded the sync request of event [${candidate.eventId}] with transaction [${candidate.txId}]`,
     );
 
     await this.approvalSemaphore.acquire().then(async (release) => {
       try {
-        const activeSync = this.activeSyncMap.get(tx.eventId);
-        if (activeSync) {
-          activeSync.responses[senderIndex] = tx;
-          const occurrences = countBy(activeSync.responses.filter((_) => _));
+        this.assertGuardAuthority();
+        if (
+          this.activeSyncMap.get(candidate.eventId) === activeSync &&
+          activeSync.responses[senderIndex] === undefined
+        ) {
+          const response = this.copyPayment(json);
+          this.responseJson.set(response, json);
+          activeSync.responses[senderIndex] = response;
+          const votes = activeSync.responses.filter(
+            (previous) =>
+              previous &&
+              (this.responseJson.get(previous) ?? previous.toJson()) === json,
+          ).length;
 
-          if (
-            Math.max(...Object.values(occurrences)) >= this.requiredApproval
-          ) {
+          if (votes >= this.requiredApproval) {
             logger.info(
-              `The majority of guards responded the sync request of event [${tx.eventId}] with transaction [${tx.txId}]`,
+              `The majority of guards responded the sync request of event [${candidate.eventId}] with transaction [${candidate.txId}]`,
             );
-            await this.setTxAsApproved(tx);
+            await this.setTxAsApproved(this.copyPayment(json), actualTxId);
           } else {
             logger.debug(
-              `event [${tx.eventId}] sync status is: [${JSON.stringify(
+              `event [${candidate.eventId}] sync status is: [${JSON.stringify(
                 activeSync.responses.map((_) => _?.txId),
               )}]`,
             );
@@ -416,9 +505,12 @@ class EventSynchronization extends Communicator {
    * @returns true if transaction verified
    */
   protected verifySynchronizationResponse = async (
-    tx: PaymentTransaction,
+    input: PaymentTransaction,
     actualTxId: string,
   ): Promise<boolean> => {
+    this.assertGuardAuthority();
+    const json = input.toJson();
+    const tx = this.copyPayment(json);
     const baseError = `Received tx [${tx.txId}] for syncing event [${tx.eventId}] but `;
     // verify sync request
     const activeSync = this.activeSyncMap.get(tx.eventId);
@@ -436,6 +528,13 @@ class EventSynchronization extends Communicator {
     }
     const event = EventSerializer.fromConfirmedEntity(eventEntity);
 
+    if (tx.network !== event.toChain) {
+      logger.warn(
+        baseError + 'transaction network differs from event destination',
+      );
+      return false;
+    }
+
     // verify tx type
     if (tx.txType !== TransactionType.payment) {
       logger.warn(baseError + `transaction type is unexpected (${tx.txType})`);
@@ -444,19 +543,31 @@ class EventSynchronization extends Communicator {
 
     // verify PaymentTransaction object consistency
     const chain = ChainHandler.getInstance().getChain(tx.network);
-    if (!(await chain.verifyPaymentTransaction(tx))) {
+    const consistent =
+      tx.network === 'ergo'
+        ? await (chain as ErgoChain).verifyPaymentTransaction(
+            tx,
+            SigningStatus.Signed,
+          )
+        : await chain.verifyPaymentTransaction(tx);
+    if (!consistent) {
       logger.warn(baseError + `tx object has inconsistency`);
       return false;
     }
 
     // verify tx order
     const feeConfig = MinimumFeeHandler.getEventFeeConfig(event);
-    const txOrder = chain.extractTransactionOrder(tx);
+    const txOrder =
+      tx.network === 'ergo'
+        ? (chain as ErgoChain).extractTransactionOrder(tx, SigningStatus.Signed)
+        : chain.extractTransactionOrder(tx);
+    const eventWIDs =
+      tx.network === 'ergo' ? await EventBoxes.getEventWIDs(event) : [];
     const expectedOrder = await EventOrder.createEventPaymentOrder(
       event,
       eventEntity.eventData.txId,
       feeConfig,
-      [],
+      eventWIDs,
     );
     if (!isEqual(txOrder, expectedOrder)) {
       logger.warn(baseError + `tx extracted order is not verified`);
@@ -464,15 +575,19 @@ class EventSynchronization extends Communicator {
     }
 
     // check if tx is confirmed enough
+    let settlementId: string;
+    try {
+      settlementId = this.bindActualTransactionId(tx, actualTxId);
+    } catch {
+      logger.warn(baseError + 'signed transaction identity is not verified');
+      return false;
+    }
     const txConfirmation = await chain.getTxConfirmationStatus(
-      actualTxId,
+      settlementId,
       tx.txType,
     );
-    if (txConfirmation === ConfirmationStatus.NotConfirmedEnough) {
+    if (txConfirmation !== ConfirmationStatus.ConfirmedEnough) {
       logger.warn(baseError + `tx is not confirmed enough`);
-      return false;
-    } else if (txConfirmation === ConfirmationStatus.NotFound) {
-      logger.warn(baseError + `tx is not found`);
       return false;
     }
 
@@ -482,16 +597,24 @@ class EventSynchronization extends Communicator {
       return false;
     }
 
-    return true;
+    this.assertGuardAuthority();
+    return tx.toJson() === json;
   };
 
   /**
    * inserts the transaction as completed into db and updates the event
    * @param tx
    */
-  protected setTxAsApproved = async (tx: PaymentTransaction): Promise<void> => {
+  protected setTxAsApproved = async (
+    input: PaymentTransaction,
+    actualTxId: string,
+  ): Promise<void> => {
+    const json = input.toJson();
+    this.assertGuardAuthority();
+    const tx = this.copyPayment(json);
+    const active = this.activeSyncMap.get(tx.eventId);
+    if (!active) throw new Error('Synchronization is no longer active');
     const dbAction = DatabaseAction.getInstance();
-    const txRecord = await dbAction.getTxById(tx.txId);
     const event = await dbAction.getEventById(tx.eventId);
     try {
       if (event === null) {
@@ -499,26 +622,44 @@ class EventSynchronization extends Communicator {
           `Tx [${tx.txId}] is approved as event [${tx.eventId}] payment but event is not found`,
         );
       }
-      if (txRecord !== null) {
-        throw new ImpossibleBehavior(
-          `Tx [${tx.txId}] is already in database with status [${txRecord.status}]`,
-        );
-      }
+      const expectedEvent = structuredClone(event);
+      const requiredSign = this.requiredApproval + 1;
+
+      this.assertGuardAuthority();
+
+      // A quorum may have waited behind another approval.
+      // Repeat verification before admitting the current payment.
+      if (
+        this.activeSyncMap.get(tx.eventId) !== active ||
+        !(await this.verifySynchronizationResponse(tx, actualTxId))
+      )
+        throw new Error('Synchronization payment is no longer verified');
 
       const currentHeight = await ChainHandler.getInstance()
         .getChain(tx.network)
         .getHeight();
-      await dbAction.insertCompletedTx(
-        tx,
-        event,
-        GuardPkHandler.getInstance().requiredSign,
-        null,
-        currentHeight,
-      );
-      await DatabaseAction.getInstance().setEventStatusToPending(
-        tx.eventId,
-        EventStatus.pendingReward,
-      );
+
+      this.assertGuardAuthority();
+
+      if (
+        tx.toJson() !== json ||
+        this.activeSyncMap.get(tx.eventId) !== active ||
+        !Number.isSafeInteger(currentHeight) ||
+        currentHeight < 0
+      )
+        throw new Error('Synchronization context or height changed');
+
+      if (
+        !(await dbAction.insertSynchronizedPaymentIfUnchanged(
+          tx,
+          expectedEvent,
+          requiredSign,
+          currentHeight,
+          this.assertGuardAuthority,
+        ))
+      )
+        throw new Error('Synchronization persistence conflict');
+
       this.activeSyncMap.delete(tx.eventId);
     } catch (e) {
       logger.warn(
