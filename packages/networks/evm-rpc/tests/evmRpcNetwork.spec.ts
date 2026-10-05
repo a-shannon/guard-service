@@ -1,7 +1,9 @@
 import { randomBytes } from 'crypto';
+import { FetchRequest, JsonRpcProvider } from 'ethers';
 import { vi } from 'vitest';
 
 import { AddressTxsEntity } from '@rosen-bridge/evm-address-tx-extractor';
+import { DataSource } from '@rosen-bridge/extended-typeorm';
 import { Repository } from '@rosen-bridge/extended-typeorm';
 import { FailedError } from '@rosen-chains/abstract-chain';
 import { EvmTxStatus } from '@rosen-chains/evm';
@@ -9,6 +11,7 @@ import { EvmTxStatus } from '@rosen-chains/evm';
 import { mockDataSource } from './mocked/dataSource.mock';
 import './mocked/ethers.mock';
 import { ContractInstance } from './mocked/ethers.mock';
+import { mockGetUrl, mockRealRpcProvider } from './mocked/realRpcProvider.mock';
 import * as testData from './testData';
 import { TestEvmRpcNetwork } from './testEvmRpcNetwork';
 
@@ -749,5 +752,138 @@ describe('EvmRpcNetwork', () => {
         unsignedHash,
       );
     });
+  });
+  describe('constructor', () => {
+    const providers: JsonRpcProvider[] = [];
+    const networks: TestEvmRpcNetwork[] = [];
+    const { url, lock } = testData.rpcTransportControlData;
+    const getRepository = vi.fn(() => ({}));
+    const database = { getRepository } as unknown as DataSource;
+    const db = database;
+    let restoreProvider: () => void;
+    beforeEach(async () => {
+      getRepository.mockClear();
+      restoreProvider = await mockRealRpcProvider();
+    });
+    afterEach(() => {
+      providers.splice(0).forEach((provider) => provider.destroy());
+      networks.splice(0).forEach((network) => network['provider'].destroy());
+      restoreProvider();
+    });
+    /**
+     * @target EvmRpcNetwork.constructor installs the hook before provider cloning, including when no custom timeout is given
+     * @dependencies
+     * - Real ethers provider scoped over the existing constructor mock.
+     * - Synthetic repository spy and synthetic transport hook.
+     * @scenario
+     * - Construct generic EVM providers with the hook and both default/explicit deadlines.
+     * @expected
+     * - The hook reference is installed before cloning and the timeout is exact.
+     */
+    it('installs the hook before provider cloning, including when no custom timeout is given', () => {
+      for (const timeout of [undefined, 120]) {
+        const network = new TestEvmRpcNetwork(
+          'synthetic',
+          'https://fixture.invalid',
+          db,
+          'lock',
+          undefined,
+          undefined,
+          timeout,
+          mockGetUrl,
+        );
+        const provider = network['provider'];
+        providers.push(provider);
+        expect(provider._getConnection().getUrlFunc).toEqual(mockGetUrl);
+        expect(provider._getConnection().timeout).toEqual(timeout ?? 300000);
+      }
+    });
+
+    /**
+     * @target EvmRpcNetwork.constructor preserves the legacy default transport with and without an explicit timeout
+     * @dependencies
+     * - Real ethers provider scoped over the existing constructor mock.
+     * - Synthetic repository spy and synthetic transport hook.
+     * @scenario
+     * - Construct generic EVM providers without a hook at default/explicit deadlines.
+     * @expected
+     * - The original SDK transport reference and deadline remain intact.
+     */
+    it('preserves the legacy default transport with and without an explicit timeout', () => {
+      for (const timeout of [undefined, 120]) {
+        const network = new TestEvmRpcNetwork(
+          'synthetic',
+          'https://fixture.invalid',
+          db,
+          'lock',
+          undefined,
+          undefined,
+          timeout,
+        );
+        const provider = network['provider'];
+        providers.push(provider);
+        expect(provider._getConnection().getUrlFunc).toEqual(
+          new FetchRequest('https://fixture.invalid').getUrlFunc,
+        );
+        expect(provider._getConnection().timeout).toEqual(timeout ?? 300000);
+      }
+    });
+
+    /**
+     * @target EvmRpcNetwork.constructor preserves the old shared EVM default and auth (%s)
+     * @dependencies
+     * - Real ethers provider scoped over the existing constructor mock.
+     * - Synthetic repository spy and synthetic transport hook.
+     * @scenario
+     * - Construct the old generic EVM adapter with each auth variant and no deadline.
+     * @expected
+     * - The original300000ms default and auth URL remain intact.
+     */
+    it.each([undefined, 'synthetic-token'])(
+      'preserves the old shared EVM default and auth (%s)',
+      (authToken) => {
+        const network = new TestEvmRpcNetwork(
+          'ethereum',
+          url,
+          database,
+          lock,
+          authToken,
+        );
+        networks.push(network);
+        expect(network['provider']._getConnection().timeout).toEqual(300000);
+        expect(network['provider']._getConnection().url).toEqual(
+          authToken ? `${url}/${authToken}` : url,
+        );
+      },
+    );
+
+    /**
+     * @target EvmRpcNetwork.constructor rejects invalid explicitly supplied shared hook timeout %s
+     * @dependencies
+     * - Real ethers provider scoped over the existing constructor mock.
+     * - Synthetic repository spy and synthetic transport hook.
+     * @scenario
+     * - Supply each malformed explicit deadline to the shared EVM constructor.
+     * @expected
+     * - Shared timeout validation rejects before repository effects.
+     */
+    it.each([null, '1000', true, 0, -1, 0.5, NaN, Infinity, 2147483648])(
+      'rejects invalid explicitly supplied shared hook timeout %s',
+      (timeoutMs) => {
+        expect(
+          () =>
+            new TestEvmRpcNetwork(
+              'ethereum',
+              url,
+              database,
+              lock,
+              undefined,
+              undefined,
+              timeoutMs as number,
+            ),
+        ).toThrow('EVM RPC timeout');
+        expect(getRepository).not.toHaveBeenCalled();
+      },
+    );
   });
 });

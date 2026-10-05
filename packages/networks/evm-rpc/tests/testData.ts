@@ -109,3 +109,9 @@ export const feeDataResponse = new FeeData(
   maxFeePerGas,
   maxPriorityFeePerGas,
 );
+
+/** Synthetic path and account retained by shared constructor transport controls. */
+export const rpcTransportControlData = {
+  url: 'http://127.0.0.1:1/ext/bc/C/rpc',
+  lock: '0x' + '11'.repeat(20),
+};

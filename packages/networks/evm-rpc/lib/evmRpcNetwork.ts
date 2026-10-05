@@ -5,6 +5,8 @@ import {
   TransactionResponse,
   ethers,
   FeeData,
+  FetchRequest,
+  FetchGetUrlFunc,
   isCallException,
 } from 'ethers';
 
@@ -40,12 +42,28 @@ class EvmRpcNetwork extends AbstractEvmNetwork {
     lockAddress: string,
     authToken?: string,
     logger?: AbstractLogger,
+    timeoutMs?: number,
+    getUrlFunc?: FetchGetUrlFunc,
   ) {
     super(logger);
+    if (
+      timeoutMs !== undefined &&
+      (typeof timeoutMs !== 'number' ||
+        !Number.isSafeInteger(timeoutMs) ||
+        timeoutMs < 1 ||
+        timeoutMs > 2147483647)
+    )
+      throw new Error('Invalid EVM RPC timeout');
     this.chain = chain;
-    this.provider = authToken
-      ? new JsonRpcProvider(`${url}/${authToken}`)
-      : new JsonRpcProvider(`${url}`);
+    const rpcUrl = authToken ? `${url}/${authToken}` : `${url}`;
+    if (timeoutMs === undefined && getUrlFunc === undefined)
+      this.provider = new JsonRpcProvider(rpcUrl);
+    else {
+      const request = new FetchRequest(rpcUrl);
+      if (timeoutMs !== undefined) request.timeout = timeoutMs;
+      if (getUrlFunc !== undefined) request.getUrlFunc = getUrlFunc;
+      this.provider = new JsonRpcProvider(request);
+    }
     this.dbAction = new AddressTxAction(lockAddress, dataSource, logger);
     this.lockAddress = lockAddress;
   }
