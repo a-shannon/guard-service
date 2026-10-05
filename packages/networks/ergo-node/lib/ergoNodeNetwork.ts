@@ -9,7 +9,11 @@ import {
   TokenDetail,
   UNKNOWN_TOKEN,
 } from '@rosen-chains/abstract-chain';
-import { AbstractErgoNetwork } from '@rosen-chains/ergo';
+import {
+  AbstractErgoNetwork,
+  AuthorizedErgoSubmission,
+  submitAuthorizedErgoTransaction,
+} from '@rosen-chains/ergo';
 import ergoNodeClientFactory, {
   IndexedErgoBox,
 } from '@rosen-clients/ergo-node';
@@ -30,9 +34,11 @@ interface ErgoLibSerializableObject {
 
 class ErgoNodeNetwork extends AbstractErgoNetwork {
   private client: ReturnType<typeof ergoNodeClientFactory>;
+  private readonly submissionBaseUrl: string;
 
   constructor({ logger, nodeBaseUrl }: ErgoNodeNetworkOptions) {
     super(logger);
+    this.submissionBaseUrl = nodeBaseUrl;
     this.client = ergoNodeClientFactory(nodeBaseUrl);
   }
 
@@ -247,6 +253,24 @@ class ErgoNodeNetwork extends AbstractErgoNetwork {
         `Failed to submit transaction [${txId}] to Ergo Node:`,
       );
     }
+  };
+
+  /** Submits signed transaction bytes through the qualified Ergo transport. */
+  public submitAuthorizedTransaction = async (
+    tx: ergoLib.Transaction,
+    options: Pick<AuthorizedErgoSubmission, 'timeoutMs' | 'authorizeSubmit'>,
+  ): Promise<void> => {
+    const captured = Object.freeze({
+      timeoutMs: options.timeoutMs,
+      authorizeSubmit: options.authorizeSubmit,
+    });
+    const body = Buffer.from(tx.sigma_serialize_bytes()).toString('hex');
+    await submitAuthorizedErgoTransaction({
+      ...captured,
+      baseUrl: this.submissionBaseUrl,
+      target: 'node',
+      body,
+    });
   };
 
   /**

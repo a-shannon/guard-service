@@ -28,6 +28,10 @@ import { ERG, ERGO_CHAIN, NUMBER_OF_BLOCKS_PER_YEAR } from './constants';
 import ErgoTransaction from './ergoTransaction';
 import ErgoUtils from './ergoUtils';
 import AbstractErgoNetwork from './network/abstractErgoNetwork';
+import {
+  AuthorizedErgoSubmission,
+  AuthorizedSubmissionError,
+} from './network/authorizedSubmission';
 import Serializer from './serializer';
 import { ErgoConfigs, ErgoSignMediator, GuardsPkConfig } from './types';
 
@@ -754,17 +758,63 @@ class ErgoChain extends AbstractUtxoChain<wasm.Transaction, wasm.ErgoBox> {
    */
   submitTransaction = async (
     transaction: PaymentTransaction,
+    authorization?: Pick<
+      AuthorizedErgoSubmission,
+      'timeoutMs' | 'authorizeSubmit'
+    >,
+  ): Promise<void> =>
+    this.submitCapturedTransaction(transaction, authorization);
+
+  /** Explicit capability: never dispatch through the overridable legacy API. */
+  submitAuthorizedTransaction = async (
+    transaction: PaymentTransaction,
+    authorization: Pick<
+      AuthorizedErgoSubmission,
+      'timeoutMs' | 'authorizeSubmit'
+    >,
   ): Promise<void> => {
+    const captured = Object.freeze({
+      timeoutMs: authorization?.timeoutMs,
+      authorizeSubmit: authorization?.authorizeSubmit,
+    });
+    if (
+      !Number.isSafeInteger(captured.timeoutMs) ||
+      captured.timeoutMs < 1 ||
+      captured.timeoutMs > 2147483647 ||
+      typeof captured.authorizeSubmit !== 'function'
+    )
+      throw new AuthorizedSubmissionError('invalid');
+    return this.submitCapturedTransaction(transaction, captured);
+  };
+
+  /** Submits captured signed bytes and preserves authorized failure handling. */
+private submitCapturedTransaction = async (
+    transaction: PaymentTransaction,
+    authorization?: Pick<
+      AuthorizedErgoSubmission,
+      'timeoutMs' | 'authorizeSubmit'
+    >,
+  ): Promise<void> => {
+    const captured =
+      authorization === undefined
+        ? undefined
+        : Object.freeze({
+            timeoutMs: authorization.timeoutMs,
+            authorizeSubmit: authorization.authorizeSubmit,
+          });
     // deserialize transaction
     const tx = Serializer.signedDeserialize(transaction.txBytes);
 
     // send transaction
     try {
-      const response = await this.network.submitTransaction(tx);
+      const response = captured
+        ? await this.network.submitAuthorizedTransaction(tx, captured)
+        : await this.network.submitTransaction(tx);
       this.logger.info(
         `Ergo Transaction [${transaction.txId}] submitted. Response: ${response}`,
       );
     } catch (e) {
+      if (captured) throw e;
       this.logger.warn(
         `An error occurred while submitting Ergo transaction [${transaction.txId}]: ${e}`,
       );

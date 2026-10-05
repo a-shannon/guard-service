@@ -2,6 +2,11 @@ import { ErgoBox, ErgoStateContext, Transaction } from 'ergo-lib-wasm-nodejs';
 
 import { AbstractUtxoChainNetwork } from '@rosen-chains/abstract-chain';
 
+import {
+  AuthorizedErgoSubmission,
+  AuthorizedSubmissionError,
+} from './authorizedSubmission';
+
 abstract class AbstractErgoNetwork extends AbstractUtxoChainNetwork<
   Transaction,
   ErgoBox
@@ -11,6 +16,14 @@ abstract class AbstractErgoNetwork extends AbstractUtxoChainNetwork<
    * @param transaction the transaction
    */
   declare submitTransaction: (transaction: Transaction) => Promise<void>;
+
+  /** Older network implementations must never fall back to an unguarded send. */
+  submitAuthorizedTransaction: (
+    transaction: Transaction,
+    options: Pick<AuthorizedErgoSubmission, 'timeoutMs' | 'authorizeSubmit'>,
+  ) => Promise<void> = async () => {
+    throw new AuthorizedSubmissionError('invalid');
+  };
 
   /**
    * gets the context of blockchain using 10 last blocks

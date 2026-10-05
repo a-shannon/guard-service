@@ -1,24 +1,34 @@
 import * as wasm from 'ergo-lib-wasm-nodejs';
-
+import { createServer } from 'node:http';
 import { TokenMap } from '@rosen-bridge/tokens';
-import {
-  BlockInfo,
-  BoxInfo,
-  NotEnoughAssetsError,
-  NotEnoughValidBoxesError,
-  SigningStatus,
-  TransactionType,
-} from '@rosen-chains/abstract-chain';
-
+import { BlockInfo } from '@rosen-chains/abstract-chain';
+import { BoxInfo } from '@rosen-chains/abstract-chain';
+import { NotEnoughAssetsError } from '@rosen-chains/abstract-chain';
+import { NotEnoughValidBoxesError } from '@rosen-chains/abstract-chain';
+import { SigningStatus } from '@rosen-chains/abstract-chain';
+import { TransactionType } from '@rosen-chains/abstract-chain';
+import ErgoNodeNetwork from '@rosen-chains/ergo-node-network';
 import { ErgoChain } from '../lib';
 import { ErgoConfigs } from '../lib';
 import ErgoTransaction from '../lib/ergoTransaction';
+import AbstractErgoNetwork from '../lib/network/abstractErgoNetwork';
+import { AuthorizedSubmissionError } from '../lib/network/authorizedSubmission';
+
 import * as boxTestData from './boxTestData';
 import * as ergoTestUtils from './ergoTestUtils';
-import TestErgoNetwork from './network/testErgoNetwork';
-import * as transactionTestData from './transactionTestData';
+import { generateChainObject } from './ergoTestUtils';
 
+import TestErgoNetwork from './network/testErgoNetwork';
+import { generateAuthorizedPayment } from './testUtils/authorizedSubmission';
+import { generateSubmissionOptions } from './testUtils/authorizedSubmission';
+
+
+import * as transactionTestData from './transactionTestData';
+import { transaction2SignedSerialized } from './transactionTestData';
+import { transaction2PartialUnsignedPaymentTransaction } from './transactionTestData';
+import { transaction5PaymentTransaction } from './transactionTestData';
 describe('ErgoChain', () => {
+describe('baseline scenarios', () => {
   describe('generateTransaction', () => {
     /**
      * @target ErgoChain.generateTransaction should throw error when
@@ -2725,6 +2735,448 @@ describe('ErgoChain', () => {
 
       // check returned value
       expect(result).toEqual(false);
+    });
+  });
+
+});
+
+  describe('submitTransaction', () => {
+    describe('submitTransaction', () => {
+      describe('qualified chain authorization 1', () => {
+        const payment = generateAuthorizedPayment;
+        const options = generateSubmissionOptions;
+
+        const method = 'submitTransaction' as const;
+        /**
+         * @target ErgoChain.submitTransaction `${method} denies an unsupported network before invoking its legacy submit method`
+         * @dependencies
+         * - TestErgoNetwork and signed payment fixtures; explicit authorization
+         * callback.
+         * @scenario
+         * - Create the network/payment/callback fixtures. Apply the case-specific
+         * denial or mutation, invoke the selected chain method, and inspect
+         * captured bytes and downstream calls. - Prepare `network`, `legacy`.
+         * @expected
+         * - `expect( generateChainObject(network)[method](payment(), options()),
+         * ).rejects.toBeInstanceOf(AuthorizedSubmissionError)`. -
+         * `expect(legacy).not.toHaveBeenCalled()`.
+         */
+        it(`${method} denies an unsupported network before invoking its legacy submit method`, async () => {
+          const network = new TestErgoNetwork(),
+            legacy = vi.spyOn(network, 'submitTransaction');
+          await expect(
+            generateChainObject(network)[method](payment(), options()),
+          ).rejects.toBeInstanceOf(AuthorizedSubmissionError);
+          expect(legacy).not.toHaveBeenCalled();
+        });
+        /**
+         * @target ErgoChain.submitTransaction `${method} propagates qualified failure without reporting success: %s`
+         * @dependencies
+         * - TestErgoNetwork and signed payment fixtures; explicit authorization
+         * callback.
+         * @scenario
+         * - Create the network/payment/callback fixtures. Apply the case-specific
+         * denial or mutation, invoke the selected chain method, and inspect
+         * captured bytes and downstream calls. - Prepare `network`. - Apply
+         * `vi.spyOn(network, 'submitAuthorizedTransaction').mockRejectedValue(
+         * failure, )`. - Prepare `legacy`.
+         * @expected
+         * - `expect( generateChainObject(network)[method](payment(), options()),
+         * ).rejects.toBe(failure)`. - `expect(legacy).not.toHaveBeenCalled()`.
+         */
+        it.each([
+          new AuthorizedSubmissionError('denied'),
+          new AuthorizedSubmissionError('expired'),
+          new Error('HTTP failure'),
+        ])(
+          `${method} propagates qualified failure without reporting success: %s`,
+          async (failure) => {
+            const network = new TestErgoNetwork();
+            vi.spyOn(network, 'submitAuthorizedTransaction').mockRejectedValue(
+              failure,
+            );
+            const legacy = vi.spyOn(network, 'submitTransaction');
+            await expect(
+              generateChainObject(network)[method](payment(), options()),
+            ).rejects.toBe(failure);
+            expect(legacy).not.toHaveBeenCalled();
+          },
+        );
+        /**
+         * @target ErgoChain.submitTransaction `${method} captures immutable callback/timeout and exact signed bytes before waiting`
+         * @dependencies
+         * - TestErgoNetwork and signed payment fixtures; explicit authorization
+         * callback.
+         * @scenario
+         * - Create the network/payment/callback fixtures. Apply the case-specific
+         * denial or mutation, invoke the selected chain method, and inspect
+         * captured bytes and downstream calls. - Prepare `network`, `tx`, `input`.
+         * - Prepare `callback`. - Prepare `finish`. - Prepare `gate`. - Prepare
+         * `received`. - Prepare `pending`. - Apply `input.timeoutMs = 1`. - Apply
+         * `input.authorizeSubmit = async () => { throw Error('replacement'); }`. -
+         * Apply `tx.txBytes = Buffer.from('00', 'hex')`. - Apply `finish()`. -
+         * Apply `await pending`.
+         * @expected
+         * - `expect( Buffer.from(signed.sigma_serialize_bytes()).toString('hex'),
+         * ).toEqual(transaction2SignedSerialized)`. -
+         * `expect(authorization.authorizeSubmit).toBe(callback)`. -
+         * `expect(authorization.timeoutMs).toEqual(1000)`. -
+         * `expect(Object.isFrozen(authorization)).toEqual(true)`. -
+         * `expect(received).toBeDefined()`.
+         */
+        it(`${method} captures immutable callback/timeout and exact signed bytes before waiting`, async () => {
+          const network = new TestErgoNetwork(),
+            tx = payment(),
+            input = options();
+          const callback = input.authorizeSubmit;
+          let finish!: () => void;
+          const gate = new Promise<void>((resolve) => {
+            finish = resolve;
+          });
+          let received:
+            | Parameters<typeof network.submitAuthorizedTransaction>[1]
+            | undefined;
+          vi.spyOn(network, 'submitAuthorizedTransaction').mockImplementation(
+            async (signed, authorization) => {
+              received = authorization;
+              expect(
+                Buffer.from(signed.sigma_serialize_bytes()).toString('hex'),
+              ).toEqual(transaction2SignedSerialized);
+              await gate;
+              expect(authorization.authorizeSubmit).toBe(callback);
+              expect(authorization.timeoutMs).toEqual(1000);
+              expect(Object.isFrozen(authorization)).toEqual(true);
+            },
+          );
+          const pending = generateChainObject(network)[method](tx, input);
+          expect(received).toBeDefined();
+          input.timeoutMs = 1;
+          input.authorizeSubmit = async () => {
+            throw Error('replacement');
+          };
+          tx.txBytes = Buffer.from('00', 'hex');
+          finish();
+          await pending;
+        });
+      });
+      describe('qualified chain authorization 4', () => {
+        const payment = generateAuthorizedPayment;
+
+        /**
+         * @target ErgoChain.submitTransaction 'preserves legacy behavior when legacy network fails=%s'
+         * @dependencies
+         * - TestErgoNetwork legacy and qualified submit spies.
+         * @scenario
+         * - Configure the legacy network to succeed or fail. Submit without
+         * explicit authorization and inspect the legacy and qualified call paths.
+         * - Prepare `network`. - Prepare `legacy`. - Prepare `qualified`.
+         * @expected
+         * - `expect( generateChainObject(network).submitTransaction(payment()),
+         * ).resolves.toBeUndefined()`. - `expect(legacy).toHaveBeenCalledOnce()`.
+         * - `expect(qualified).not.toHaveBeenCalled()`.
+         */
+        it.each([false, true])(
+          'preserves legacy behavior when legacy network fails=%s',
+          async (fail) => {
+            const network = new TestErgoNetwork();
+            const legacy = vi
+              .spyOn(network as AbstractErgoNetwork, 'submitTransaction')
+              .mockImplementation(async () => {
+                if (fail) throw Error('legacy failure');
+              });
+            const qualified = vi.spyOn(network, 'submitAuthorizedTransaction');
+            await expect(
+              generateChainObject(network).submitTransaction(payment()),
+            ).resolves.toBeUndefined();
+            expect(legacy).toHaveBeenCalledOnce();
+            expect(qualified).not.toHaveBeenCalled();
+          },
+        );
+      });
+    });
+  });
+
+  describe('submitAuthorizedTransaction', () => {
+    describe('submitAuthorizedTransaction', () => {
+      describe('qualified chain authorization 2', () => {
+        const payment = generateAuthorizedPayment;
+        const options = generateSubmissionOptions;
+
+        const method = 'submitAuthorizedTransaction' as const;
+        /**
+         * @target ErgoChain.submitAuthorizedTransaction `${method} denies an unsupported network before invoking its legacy submit method`
+         * @dependencies
+         * - TestErgoNetwork and signed payment fixtures; explicit authorization
+         * callback.
+         * @scenario
+         * - Create the network/payment/callback fixtures. Apply the case-specific
+         * denial or mutation, invoke the selected chain method, and inspect
+         * captured bytes and downstream calls. - Prepare `network`, `legacy`.
+         * @expected
+         * - `expect( generateChainObject(network)[method](payment(), options()),
+         * ).rejects.toBeInstanceOf(AuthorizedSubmissionError)`. -
+         * `expect(legacy).not.toHaveBeenCalled()`.
+         */
+        it(`${method} denies an unsupported network before invoking its legacy submit method`, async () => {
+          const network = new TestErgoNetwork(),
+            legacy = vi.spyOn(network, 'submitTransaction');
+          await expect(
+            generateChainObject(network)[method](payment(), options()),
+          ).rejects.toBeInstanceOf(AuthorizedSubmissionError);
+          expect(legacy).not.toHaveBeenCalled();
+        });
+        /**
+         * @target ErgoChain.submitAuthorizedTransaction `${method} propagates qualified failure without reporting success: %s`
+         * @dependencies
+         * - TestErgoNetwork and signed payment fixtures; explicit authorization
+         * callback.
+         * @scenario
+         * - Create the network/payment/callback fixtures. Apply the case-specific
+         * denial or mutation, invoke the selected chain method, and inspect
+         * captured bytes and downstream calls. - Prepare `network`. - Apply
+         * `vi.spyOn(network, 'submitAuthorizedTransaction').mockRejectedValue(
+         * failure, )`. - Prepare `legacy`.
+         * @expected
+         * - `expect( generateChainObject(network)[method](payment(), options()),
+         * ).rejects.toBe(failure)`. - `expect(legacy).not.toHaveBeenCalled()`.
+         */
+        it.each([
+          new AuthorizedSubmissionError('denied'),
+          new AuthorizedSubmissionError('expired'),
+          new Error('HTTP failure'),
+        ])(
+          `${method} propagates qualified failure without reporting success: %s`,
+          async (failure) => {
+            const network = new TestErgoNetwork();
+            vi.spyOn(network, 'submitAuthorizedTransaction').mockRejectedValue(
+              failure,
+            );
+            const legacy = vi.spyOn(network, 'submitTransaction');
+            await expect(
+              generateChainObject(network)[method](payment(), options()),
+            ).rejects.toBe(failure);
+            expect(legacy).not.toHaveBeenCalled();
+          },
+        );
+        /**
+         * @target ErgoChain.submitAuthorizedTransaction `${method} captures immutable callback/timeout and exact signed bytes before waiting`
+         * @dependencies
+         * - TestErgoNetwork and signed payment fixtures; explicit authorization
+         * callback.
+         * @scenario
+         * - Create the network/payment/callback fixtures. Apply the case-specific
+         * denial or mutation, invoke the selected chain method, and inspect
+         * captured bytes and downstream calls. - Prepare `network`, `tx`, `input`.
+         * - Prepare `callback`. - Prepare `finish`. - Prepare `gate`. - Prepare
+         * `received`. - Prepare `pending`. - Apply `input.timeoutMs = 1`. - Apply
+         * `input.authorizeSubmit = async () => { throw Error('replacement'); }`. -
+         * Apply `tx.txBytes = Buffer.from('00', 'hex')`. - Apply `finish()`. -
+         * Apply `await pending`.
+         * @expected
+         * - `expect( Buffer.from(signed.sigma_serialize_bytes()).toString('hex'),
+         * ).toEqual(transaction2SignedSerialized)`. -
+         * `expect(authorization.authorizeSubmit).toBe(callback)`. -
+         * `expect(authorization.timeoutMs).toEqual(1000)`. -
+         * `expect(Object.isFrozen(authorization)).toEqual(true)`. -
+         * `expect(received).toBeDefined()`.
+         */
+        it(`${method} captures immutable callback/timeout and exact signed bytes before waiting`, async () => {
+          const network = new TestErgoNetwork(),
+            tx = payment(),
+            input = options();
+          const callback = input.authorizeSubmit;
+          let finish!: () => void;
+          const gate = new Promise<void>((resolve) => {
+            finish = resolve;
+          });
+          let received:
+            | Parameters<typeof network.submitAuthorizedTransaction>[1]
+            | undefined;
+          vi.spyOn(network, 'submitAuthorizedTransaction').mockImplementation(
+            async (signed, authorization) => {
+              received = authorization;
+              expect(
+                Buffer.from(signed.sigma_serialize_bytes()).toString('hex'),
+              ).toEqual(transaction2SignedSerialized);
+              await gate;
+              expect(authorization.authorizeSubmit).toBe(callback);
+              expect(authorization.timeoutMs).toEqual(1000);
+              expect(Object.isFrozen(authorization)).toEqual(true);
+            },
+          );
+          const pending = generateChainObject(network)[method](tx, input);
+          expect(received).toBeDefined();
+          input.timeoutMs = 1;
+          input.authorizeSubmit = async () => {
+            throw Error('replacement');
+          };
+          tx.txBytes = Buffer.from('00', 'hex');
+          finish();
+          await pending;
+        });
+      });
+      describe('qualified chain authorization 3', () => {
+        const payment = generateAuthorizedPayment;
+        const options = generateSubmissionOptions;
+
+        /**
+         * @target ErgoChain.submitAuthorizedTransaction 'rejects malformed explicit authorization before any submission: %s'
+         * @dependencies
+         * - TestErgoNetwork, real loopback ErgoNodeNetwork, signed transaction
+         * fixture and explicit authorization.
+         * @scenario
+         * - Prepare the signed payment and authorization input. Apply isolated
+         * malformed or overridden-legacy conditions, or hold the loopback dispatch
+         * gate. Invoke the explicit API and inspect authorization/transport calls.
+         * - Prepare `network`. - Prepare `chain`. - Prepare `legacy`. - Prepare
+         * `networkLegacy`. - Prepare `qualified`. - Prepare `malformed`. - Apply
+         * `malformed.txBytes = Uint8Array.of(255)`.
+         * @expected
+         * - `expect( chain.submitAuthorizedTransaction( malformed, authorization
+         * as Parameters< typeof chain.submitAuthorizedTransaction >[1], ),
+         * ).rejects.toMatchObject({ reason: 'invalid' })`. -
+         * `expect(legacy).not.toHaveBeenCalled()`. -
+         * `expect(networkLegacy).not.toHaveBeenCalled()`. -
+         * `expect(qualified).not.toHaveBeenCalled()`.
+         */
+        it.each([
+          undefined,
+          null,
+          {},
+          { timeoutMs: 1000 },
+          { authorizeSubmit: options().authorizeSubmit },
+          ...[0, -1, 0.5, NaN, Infinity, 2147483648, '1000'].map(
+            (timeoutMs) => ({
+              timeoutMs,
+              authorizeSubmit: options().authorizeSubmit,
+            }),
+          ),
+          ...[undefined, null, 1, 'callback', {}].map((authorizeSubmit) => ({
+            timeoutMs: 1000,
+            authorizeSubmit,
+          })),
+        ])(
+          'rejects malformed explicit authorization before any submission: %s',
+          async (authorization) => {
+            const network = new TestErgoNetwork();
+            const chain = generateChainObject(network);
+            const legacy = vi.spyOn(chain, 'submitTransaction');
+            const networkLegacy = vi.spyOn(network, 'submitTransaction');
+            const qualified = vi.spyOn(network, 'submitAuthorizedTransaction');
+            const malformed = payment();
+            malformed.txBytes = Uint8Array.of(255);
+            await expect(
+              chain.submitAuthorizedTransaction(
+                malformed,
+                authorization as Parameters<
+                  typeof chain.submitAuthorizedTransaction
+                >[1],
+              ),
+            ).rejects.toMatchObject({ reason: 'invalid' });
+            expect(legacy).not.toHaveBeenCalled();
+            expect(networkLegacy).not.toHaveBeenCalled();
+            expect(qualified).not.toHaveBeenCalled();
+          },
+        );
+        /**
+         * @target ErgoChain.submitAuthorizedTransaction 'never invokes an overridden legacy chain method from the explicit API'
+         * @dependencies
+         * - TestErgoNetwork, real loopback ErgoNodeNetwork, signed transaction
+         * fixture and explicit authorization.
+         * @scenario
+         * - Prepare the signed payment and authorization input. Apply isolated
+         * malformed or overridden-legacy conditions, or hold the loopback dispatch
+         * gate. Invoke the explicit API and inspect authorization/transport calls.
+         * - Prepare `network`. - Prepare `chain`. - Apply `chain.submitTransaction
+         * = vi.fn(async () => undefined)`. - Prepare `failure`. - Prepare
+         * `qualified`.
+         * @expected
+         * - `expect( chain.submitAuthorizedTransaction(payment(), options()),
+         * ).rejects.toBe(failure)`. - `expect(qualified).toHaveBeenCalledOnce()`.
+         * - `expect(chain.submitTransaction).not.toHaveBeenCalled()`.
+         */
+        it('never invokes an overridden legacy chain method from the explicit API', async () => {
+          const network = new TestErgoNetwork();
+          const chain = generateChainObject(network);
+          chain.submitTransaction = vi.fn(async () => undefined);
+          const failure = new AuthorizedSubmissionError('denied');
+          const qualified = vi
+            .spyOn(network, 'submitAuthorizedTransaction')
+            .mockRejectedValue(failure);
+          await expect(
+            chain.submitAuthorizedTransaction(payment(), options()),
+          ).rejects.toBe(failure);
+          expect(qualified).toHaveBeenCalledOnce();
+          expect(chain.submitTransaction).not.toHaveBeenCalled();
+        });
+        /**
+         * @target ErgoChain.submitAuthorizedTransaction 'dispatches exact bytes through the real Node network only after explicit admission'
+         * @dependencies
+         * - TestErgoNetwork, real loopback ErgoNodeNetwork, signed transaction
+         * fixture and explicit authorization.
+         * @scenario
+         * - Prepare the signed payment and authorization input. Apply isolated
+         * malformed or overridden-legacy conditions, or hold the loopback dispatch
+         * gate. Invoke the explicit API and inspect authorization/transport calls.
+         * - Prepare `bodies`. - Prepare `paths`. - Prepare `server`. - Apply
+         * `await new Promise<void>((resolve) => server.listen(0, '127.0.0.1',
+         * resolve))`. - Observe the transaction operation and reclaim the owned
+         * WASM or HTTP fixture in the finally branch.
+         * @expected
+         * - `expect(bodies).toEqual([])`. -
+         * `expect(authorization).toHaveBeenCalledOnce()`. -
+         * `expect(paths).toEqual(['/transactions/bytes'])`. -
+         * `expect(bodies).toEqual([JSON.stringify(transaction2SignedSerialized)])`.
+         * - `expect(legacy).not.toHaveBeenCalled()`.
+         */
+        it('dispatches exact bytes through the real Node network only after explicit admission', async () => {
+          const bodies: string[] = [];
+          const paths: string[] = [];
+          const server = createServer((request, response) => {
+            paths.push(request.url!);
+            let body = '';
+            request.on('data', (chunk) => {
+              body += chunk;
+            });
+            request.on('end', () => {
+              bodies.push(body);
+              response.writeHead(200, { 'Content-Type': 'application/json' });
+              response.end('"accepted"');
+            });
+          });
+          await new Promise<void>((resolve) =>
+            server.listen(0, '127.0.0.1', resolve),
+          );
+          try {
+            const address = server.address();
+            if (!address || typeof address === 'string')
+              throw Error('No listener');
+            const network = new ErgoNodeNetwork({
+              nodeBaseUrl: `http://127.0.0.1:${address.port}`,
+            });
+            const chain = generateChainObject(new TestErgoNetwork());
+            chain.network = network;
+            const legacy = vi.spyOn(network, 'submitTransaction');
+            const authorization = vi.fn(async (start: () => void) => {
+              expect(bodies).toEqual([]);
+              start();
+            });
+            await chain.submitAuthorizedTransaction(payment(), {
+              timeoutMs: 1000,
+              authorizeSubmit: authorization,
+            });
+            expect(authorization).toHaveBeenCalledOnce();
+            expect(paths).toEqual(['/transactions/bytes']);
+            expect(bodies).toEqual([
+              JSON.stringify(transaction2SignedSerialized),
+            ]);
+            expect(legacy).not.toHaveBeenCalled();
+          } finally {
+            server.closeAllConnections();
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+          }
+        });
+      });
     });
   });
 });

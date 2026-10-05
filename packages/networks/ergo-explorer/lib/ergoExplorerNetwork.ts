@@ -9,7 +9,11 @@ import {
   UNKNOWN_TOKEN,
   UnexpectedApiError,
 } from '@rosen-chains/abstract-chain';
-import { AbstractErgoNetwork } from '@rosen-chains/ergo';
+import {
+  AbstractErgoNetwork,
+  AuthorizedErgoSubmission,
+  submitAuthorizedErgoTransaction,
+} from '@rosen-chains/ergo';
 import ergoExplorerClientFactory, {
   V0,
   V1,
@@ -35,9 +39,11 @@ interface ErgoLibSerializableObject {
 
 class ErgoExplorerNetwork extends AbstractErgoNetwork {
   private client: ReturnType<typeof ergoExplorerClientFactory>;
+  private readonly submissionBaseUrl: string;
 
   constructor({ logger, explorerBaseUrl }: ErgoExplorerNetworkOptions) {
     super(logger);
+    this.submissionBaseUrl = explorerBaseUrl;
     this.client = ergoExplorerClientFactory(explorerBaseUrl);
   }
 
@@ -270,6 +276,24 @@ class ErgoExplorerNetwork extends AbstractErgoNetwork {
         `Failed to submit transaction [${txId}] to Ergo Explorer:`,
       );
     }
+  };
+
+  /** Submits signed transaction bytes through the qualified Ergo transport. */
+  public submitAuthorizedTransaction = async (
+    tx: ergoLib.Transaction,
+    options: Pick<AuthorizedErgoSubmission, 'timeoutMs' | 'authorizeSubmit'>,
+  ): Promise<void> => {
+    const captured = Object.freeze({
+      timeoutMs: options.timeoutMs,
+      authorizeSubmit: options.authorizeSubmit,
+    });
+    const body = tx.to_js_eip12();
+    await submitAuthorizedErgoTransaction({
+      ...captured,
+      baseUrl: this.submissionBaseUrl,
+      target: 'explorer',
+      body,
+    });
   };
 
   /**

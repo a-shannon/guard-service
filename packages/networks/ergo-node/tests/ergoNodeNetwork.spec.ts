@@ -1,4 +1,5 @@
 import { ErgoBox, ErgoStateContext, Transaction } from 'ergo-lib-wasm-nodejs';
+import { Server } from 'node:http';
 import { describe, expect, it, vi } from 'vitest';
 
 import JsonBigInt from '@rosen-bridge/json-bigint';
@@ -36,18 +37,23 @@ import {
   testTransactionBytes,
   tokenId,
 } from './testData';
+import {
+  createAuthorizedSubmissionFixtures,
+  getNetwork,
+} from './testUtils/authorizedSubmission';
 
+// Test-only source resolution: do not rebuild or overlay the installed package.
+vi.mock(
+  '@rosen-chains/ergo',
+  async () =>
+    await vi.importActual<Record<string, unknown>>('../../../chains/ergo/lib'),
+);
 vi.mock('@rosen-clients/ergo-node');
-
-const getNetwork = () =>
-  new ErgoNodeNetwork({
-    nodeBaseUrl: 'https://test.node',
-  });
 
 describe('ErgoNodeNetwork', () => {
   describe('getHeight', () => {
     /**
-     * @target `ErgoNodeNetwork.getHeight` should return current height
+     * @target ErgoNodeNetwork.getHeight 'should return current height'
      * @dependencies
      * @scenario
      * - mock `getNodeInfo` of ergo node client
@@ -67,8 +73,7 @@ describe('ErgoNodeNetwork', () => {
 
   describe('getTxConfirmation', () => {
     /**
-     * @target `ErgoNodeNetwork.getTxConfirmation` should return tx
-     * confirmations
+     * @target ErgoNodeNetwork.getTxConfirmation 'should return tx confirmations'
      * @dependencies
      * @scenario
      * - mock `getTxById` of ergo node client
@@ -88,8 +93,7 @@ describe('ErgoNodeNetwork', () => {
     });
 
     /**
-     * @target `ErgoNodeNetwork.getTxConfirmation` should return `-1` if tx is
-     * not found in the blockchain
+     * @target ErgoNodeNetwork.getTxConfirmation 'should return `-1` if tx is not found in the blockchain'
      * @dependencies
      * @scenario
      * - mock `getTxById` of ergo node client to reject with a 404 error
@@ -115,7 +119,7 @@ describe('ErgoNodeNetwork', () => {
 
   describe('getAddressAssets', () => {
     /**
-     * @target `ErgoNodeNetwork.getAddressAssets` should return address assets
+     * @target ErgoNodeNetwork.getAddressAssets 'should return address assets'
      * @dependencies
      * @scenario
      * - mock `getAddressBalanceTotal` of ergo node client
@@ -139,8 +143,7 @@ describe('ErgoNodeNetwork', () => {
     });
 
     /**
-     * @target `ErgoNodeNetwork.getAddressAssets` should return zero assets if
-     * no confirmed field is present in api result
+     * @target ErgoNodeNetwork.getAddressAssets 'should return zero assets if no confirmed field is present in api result'
      * @dependencies
      * @scenario
      * - mock `getAddressBalanceTotal` of ergo node client to return an object
@@ -162,8 +165,7 @@ describe('ErgoNodeNetwork', () => {
     });
 
     /**
-     * @target `ErgoNodeNetwork.getAddressAssets` should throw when some tokens
-     * don't have a `tokenId` or `amount` field
+     * @target ErgoNodeNetwork.getAddressAssets "should throw when some tokens don't have a `tokenId` or `amount` field"
      * @dependencies
      * @scenario
      * - mock `getAddressBalanceTotal` of ergo node client to an object
@@ -184,8 +186,7 @@ describe('ErgoNodeNetwork', () => {
 
   describe('getBlockTransactionIds', () => {
     /**
-     * @target `ErgoNodeNetwork.getBlockTransactionIds` should return block
-     * transaction ids
+     * @target ErgoNodeNetwork.getBlockTransactionIds 'should return block transaction ids'
      * @dependencies
      * @scenario
      * - mock `getBlockTransactionsById` of ergo node client
@@ -203,8 +204,7 @@ describe('ErgoNodeNetwork', () => {
     });
 
     /**
-     * @target `ErgoNodeNetwork.getBlockTransactionIds` should throw an error if
-     * some transaction ids are undefined
+     * @target ErgoNodeNetwork.getBlockTransactionIds 'should throw an error if some transaction ids are undefined'
      * @dependencies
      * @scenario
      * - mock `getBlockTransactionsById` of ergo node client with some invalid
@@ -223,8 +223,7 @@ describe('ErgoNodeNetwork', () => {
     });
 
     /**
-     * @target `ErgoNodeNetwork.getBlockTransactionIds` should return an empty
-     * array if block is not found in the blockchain
+     * @target ErgoNodeNetwork.getBlockTransactionIds 'should return an empty array if block is not found in the blockchain'
      * @dependencies
      * @scenario
      * - mock `getBlockTransactionsById` of ergo node client to reject with a
@@ -249,7 +248,7 @@ describe('ErgoNodeNetwork', () => {
 
   describe('getBlockInfo', () => {
     /**
-     * @target `ErgoNodeNetwork.getBlockInfo` should return block info
+     * @target ErgoNodeNetwork.getBlockInfo 'should return block info'
      * @dependencies
      * @scenario
      * - mock `getBlockHeaderById` of ergo node client
@@ -273,8 +272,7 @@ describe('ErgoNodeNetwork', () => {
 
   describe('getTransaction', () => {
     /**
-     * @target `ErgoNodeNetwork.getTransaction` should return transaction bytes
-     * hex representation
+     * @target ErgoNodeNetwork.getTransaction 'should return transaction bytes hex representation'
      * @dependencies
      * @scenario
      * - mock `getTxById` and `getBlockTransactionsById` of ergo node client
@@ -299,7 +297,7 @@ describe('ErgoNodeNetwork', () => {
 
   describe('submitTransaction', () => {
     /**
-     * @target `ErgoNodeNetwork.submitTransaction` should submit transaction
+     * @target ErgoNodeNetwork.submitTransaction 'should submit transaction'
      * @dependencies
      * @scenario
      * - mock `sendTransactionAsBytes` of ergo node client
@@ -323,8 +321,7 @@ describe('ErgoNodeNetwork', () => {
 
   describe('getMempoolTransactions', () => {
     /**
-     * @target `ErgoNodeNetwork.getMempoolTransactions` should return all
-     * mempool transactions
+     * @target ErgoNodeNetwork.getMempoolTransactions 'should return all mempool transactions'
      * @dependencies
      * @scenario
      * - mock `getUnconfirmedTransactions` of ergo node client
@@ -350,7 +347,7 @@ describe('ErgoNodeNetwork', () => {
 
   describe('getAddressBoxes', () => {
     /**
-     * @target `ErgoNodeNetwork.getAddressBoxes` should return address boxes
+     * @target ErgoNodeNetwork.getAddressBoxes 'should return address boxes'
      * @dependencies
      * @scenario
      * - mock `getBoxesByAddressUnspent` of ergo node client
@@ -372,8 +369,7 @@ describe('ErgoNodeNetwork', () => {
     });
 
     /**
-     * @target `ErgoNodeNetwork.getAddressBoxes` should return an empty array if
-     * address is not found or is invalid
+     * @target ErgoNodeNetwork.getAddressBoxes 'should return an empty array if address is not found or is invalid'
      * @dependencies
      * @scenario
      * - mock `getBoxesByAddressUnspent` of ergo node client to reject with a
@@ -402,8 +398,7 @@ describe('ErgoNodeNetwork', () => {
 
   describe('getBoxesByTokenId', () => {
     /**
-     * @target `ErgoNodeNetwork.getBoxesByTokenId` should return address boxes
-     * by token id
+     * @target ErgoNodeNetwork.getBoxesByTokenId 'should return address boxes by token id'
      * @dependencies
      * @scenario
      * - mock `getBoxesByAddressUnspent` of ergo node client
@@ -440,8 +435,7 @@ describe('ErgoNodeNetwork', () => {
     });
 
     /**
-     * @target `ErgoNodeNetwork.getBoxesByTokenId` should return an empty array
-     * if address is not found or is invalid
+     * @target ErgoNodeNetwork.getBoxesByTokenId 'should return an empty array if address is not found or is invalid'
      * @dependencies
      * @scenario
      * - mock `getBoxesByAddressUnspent` of ergo node client to reject with a
@@ -474,8 +468,7 @@ describe('ErgoNodeNetwork', () => {
     });
 
     /**
-     * @target `ErgoNodeNetwork.getBoxesByTokenId` should apply offset and limit
-     * to boxes with tokens
+     * @target ErgoNodeNetwork.getBoxesByTokenId 'should apply offset and limit to boxes with tokens'
      * @dependencies
      * @scenario
      * - mock `getBoxesByAddressUnspent` of ergo node client
@@ -506,7 +499,7 @@ describe('ErgoNodeNetwork', () => {
 
   describe('getStateContext', () => {
     /**
-     * @target `ErgoNodeNetwork.getStateContext` should get state context
+     * @target ErgoNodeNetwork.getStateContext 'should get state context'
      * @dependencies
      * @scenario
      * - mock `getLastHeaders` of ergo node client
@@ -525,8 +518,7 @@ describe('ErgoNodeNetwork', () => {
 
   describe('isBoxUnspentAndValid', () => {
     /**
-     * @target `ErgoNodeNetwork.isBoxUnspentAndValid` should check if box is
-     * unspent and valid
+     * @target ErgoNodeNetwork.isBoxUnspentAndValid 'should check if box is unspent and valid'
      * @dependencies
      * @scenario
      * - mock `getIndexedBoxById` of ergo node client
@@ -545,8 +537,7 @@ describe('ErgoNodeNetwork', () => {
     });
 
     /**
-     * @target `ErgoNodeNetwork.isBoxUnspentAndValid` should return `false` if
-     * box is not found in the blockchain
+     * @target ErgoNodeNetwork.isBoxUnspentAndValid 'should return `false` if box is not found in the blockchain'
      * @dependencies
      * @scenario
      * - mock `getIndexedBoxById` of ergo node client to reject with a 404 error
@@ -571,7 +562,7 @@ describe('ErgoNodeNetwork', () => {
 
   describe('getBox', () => {
     /**
-     * @target `ErgoNodeNetwork.getBox` should return the box successfully
+     * @target ErgoNodeNetwork.getBox 'should return the box successfully'
      * @dependencies
      * @scenario
      * - mock `getIndexedBoxById` of ergo node client
@@ -597,7 +588,7 @@ describe('ErgoNodeNetwork', () => {
 
   describe('getTokenDetail', () => {
     /**
-     * @target `ErgoNodeNetwork.getTokenDetail` should return token detail successfully
+     * @target ErgoNodeNetwork.getTokenDetail 'should return token detail successfully'
      * @dependencies
      * @scenario
      * - mock `getApiV1TokensP1` of ergo explorer client
@@ -613,6 +604,172 @@ describe('ErgoNodeNetwork', () => {
 
       // check returned value
       expect(result).toEqual(expectedTokenDetail);
+    });
+  });
+  describe('submitAuthorizedTransaction', () => {
+    let server: Server | undefined;
+    const { listen, tx } = createAuthorizedSubmissionFixtures((created) => {
+      server = created;
+    });
+
+    afterEach(async () => {
+      vi.restoreAllMocks();
+      if (server) {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server!.close(() => resolve()));
+        server = undefined;
+      }
+    });
+    /**
+     * @target ErgoNodeNetwork.submitAuthorizedTransaction 'forwards exact Node wire bytes after the captured callback with URL credentials'
+     * @dependencies
+     * - Real loopback HTTP server, explicit authorizer, native WASM
+     * transaction fixture and legacy-submit spy.
+     * @scenario
+     * - Create the loopback server and network. Hold or deny explicit
+     * authorization, mutate inputs after capture, or return the selected HTTP
+     * failure. Submit and inspect exact body/path/authentication or the
+     * refusal without legacy dispatch. - Prepare `fixture`, `config`,
+     * `network`, `transaction`. - Prepare `dispatch`, `release`. - Prepare
+     * `gate`. - Prepare `options`. - Prepare `pending`. - Apply
+     * `options.timeoutMs = 1`. - Apply `options.authorizeSubmit = async () =>
+     * { throw Error('replacement'); }`. - Apply `config.nodeBaseUrl =
+     * 'https://invalid.invalid'`. - Apply `vi.spyOn(transaction,
+     * 'sigma_serialize_bytes').mockReturnValue( new Uint8Array([0]), )`. -
+     * Apply `release()`. - Apply `await pending`.
+     * @expected
+     * - `expect(dispatch).toBeDefined()`. -
+     * `expect(fixture.bodies).toEqual([])`. -
+     * `expect(fixture.bodies).toEqual([JSON.stringify(testTransactionBytes)])`.
+     * - `expect(fixture.paths).toEqual(['/prefix/transactions/bytes'])`. -
+     * `expect(fixture.auth).toEqual([ 'Basic ' +
+     * Buffer.from('fixture:password').toString('base64'), ])`.
+     */
+    it('forwards exact Node wire bytes after the captured callback with URL credentials', async () => {
+      const fixture = await listen(),
+        config = { nodeBaseUrl: fixture.url },
+        network = new ErgoNodeNetwork(config),
+        transaction = tx();
+      let dispatch!: () => void, release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const options = {
+        timeoutMs: 1000,
+        authorizeSubmit: async (start: () => void) => {
+          dispatch = start;
+          await gate;
+          start();
+        },
+      };
+      const pending = network.submitAuthorizedTransaction(transaction, options);
+      await vi.waitFor(() => expect(dispatch).toBeDefined());
+      expect(fixture.bodies).toEqual([]);
+      options.timeoutMs = 1;
+      options.authorizeSubmit = async () => {
+        throw Error('replacement');
+      };
+      config.nodeBaseUrl = 'https://invalid.invalid';
+      vi.spyOn(transaction, 'sigma_serialize_bytes').mockReturnValue(
+        new Uint8Array([0]),
+      );
+      release();
+      await pending;
+      expect(fixture.bodies).toEqual([JSON.stringify(testTransactionBytes)]);
+      expect(fixture.paths).toEqual(['/prefix/transactions/bytes']);
+      expect(fixture.auth).toEqual([
+        'Basic ' + Buffer.from('fixture:password').toString('base64'),
+      ]);
+    });
+    /**
+     * @target ErgoNodeNetwork.submitAuthorizedTransaction 'propagates authorization denial without invoking legacy send'
+     * @dependencies
+     * - Real loopback HTTP server, explicit authorizer, native WASM
+     * transaction fixture and legacy-submit spy.
+     * @scenario
+     * - Create the loopback server and network. Hold or deny explicit
+     * authorization, mutate inputs after capture, or return the selected HTTP
+     * failure. Submit and inspect exact body/path/authentication or the
+     * refusal without legacy dispatch. - Prepare `fixture`, `network`,
+     * `legacy`.
+     * @expected
+     * - `expect( network.submitAuthorizedTransaction(tx(), { timeoutMs: 1000,
+     * authorizeSubmit: async () => { throw Error('held'); }, }),
+     * ).rejects.toMatchObject({ reason: 'denied' })`. -
+     * `expect(fixture.bodies).toEqual([])`. -
+     * `expect(legacy).not.toHaveBeenCalled()`.
+     */
+    it('propagates authorization denial without invoking legacy send', async () => {
+      const fixture = await listen(),
+        network = new ErgoNodeNetwork({ nodeBaseUrl: fixture.url }),
+        legacy = vi.spyOn(network, 'submitTransaction');
+      await expect(
+        network.submitAuthorizedTransaction(tx(), {
+          timeoutMs: 1000,
+          authorizeSubmit: async () => {
+            throw Error('held');
+          },
+        }),
+      ).rejects.toMatchObject({ reason: 'denied' });
+      expect(fixture.bodies).toEqual([]);
+      expect(legacy).not.toHaveBeenCalled();
+    });
+    /**
+     * @target ErgoNodeNetwork.submitAuthorizedTransaction 'propagates HTTP failure rather than mapping it to success'
+     * @dependencies
+     * - Real loopback HTTP server, explicit authorizer, native WASM
+     * transaction fixture and legacy-submit spy.
+     * @scenario
+     * - Create the loopback server and network. Hold or deny explicit
+     * authorization, mutate inputs after capture, or return the selected HTTP
+     * failure. Submit and inspect exact body/path/authentication or the
+     * refusal without legacy dispatch. - Prepare `fixture`, `network`.
+     * @expected
+     * - `expect( network.submitAuthorizedTransaction(tx(), { timeoutMs: 1000,
+     * authorizeSubmit: async (start) => start(), }), ).rejects.toMatchObject({
+     * response: { status: 503 } })`. -
+     * `expect(fixture.bodies).toHaveLength(1)`.
+     */
+    it('propagates HTTP failure rather than mapping it to success', async () => {
+      const fixture = await listen(503),
+        network = new ErgoNodeNetwork({ nodeBaseUrl: fixture.url });
+      await expect(
+        network.submitAuthorizedTransaction(tx(), {
+          timeoutMs: 1000,
+          authorizeSubmit: async (start) => start(),
+        }),
+      ).rejects.toMatchObject({ response: { status: 503 } });
+      expect(fixture.bodies).toHaveLength(1);
+    });
+    /**
+     * @target ErgoNodeNetwork.submitAuthorizedTransaction 'requires an explicit valid timeout before invoking authorization'
+     * @dependencies
+     * - Real loopback HTTP server, explicit authorizer, native WASM
+     * transaction fixture and legacy-submit spy.
+     * @scenario
+     * - Create the loopback server and network. Hold or deny explicit
+     * authorization, mutate inputs after capture, or return the selected HTTP
+     * failure. Submit and inspect exact body/path/authentication or the
+     * refusal without legacy dispatch. - Prepare `fixture`, `network`,
+     * `authorize`.
+     * @expected
+     * - `expect( network.submitAuthorizedTransaction(tx(), { timeoutMs: 0,
+     * authorizeSubmit: authorize, }), ).rejects.toMatchObject({ reason:
+     * 'invalid' })`. - `expect(authorize).not.toHaveBeenCalled()`. -
+     * `expect(fixture.bodies).toEqual([])`.
+     */
+    it('requires an explicit valid timeout before invoking authorization', async () => {
+      const fixture = await listen(),
+        network = new ErgoNodeNetwork({ nodeBaseUrl: fixture.url }),
+        authorize = vi.fn();
+      await expect(
+        network.submitAuthorizedTransaction(tx(), {
+          timeoutMs: 0,
+          authorizeSubmit: authorize,
+        }),
+      ).rejects.toMatchObject({ reason: 'invalid' });
+      expect(authorize).not.toHaveBeenCalled();
+      expect(fixture.bodies).toEqual([]);
     });
   });
 });
